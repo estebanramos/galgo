@@ -1,6 +1,7 @@
 <p align="center">
   <img src="assets/logo.png" alt="Galgo Logo" width="180"/>
 </p>
+
 # Galgo
 
 A Rust-based security tool for scanning GitHub repositories to detect exposed secrets and sensitive information related to a specific domain.
