@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" alt="Galgo Logo" width="250"/>
+  <img src="assets/logo.png" alt="Galgo Logo" width="180"/>
 </p>
 
 # Galgo
