@@ -1,0 +1,160 @@
+[
+  {
+    "pattern": "(?i)<add[^>]*key\\s*=\\s*[\"']([^\"']*(?:passwd|password|pass)[^\"']*)[\"'][^>]*value\\s*=\\s*[\"']([^\"']{4,})[\"']",
+    "secret_type": "XML Password",
+    "description": "XML Configuration Passwords (<add key=\"passwd\" value=\"...\"/>)"
+  },
+  {
+    "pattern": "(?i)<add[^>]*key\\s*=\\s*[\"']([^\"']*passwd[^\"']*)[\"'][^>]*value\\s*=\\s*[\"']([^\"']{4,})[\"']",
+    "secret_type": "XML Password",
+    "description": "XML Configuration Passwords with passwd key (<add key=\"passwd\" value=\"...\"/> or <add key=\"passwdPMC\" value=\"...\"/>)"
+  },
+  {
+    "pattern": "(?i)<add[^>]*key\\s*=\\s*[\"']([^\"']*usuario[^\"']*)[\"'][^>]*value\\s*=\\s*[\"']([^\"']{3,})[\"']",
+    "secret_type": "XML Username",
+    "description": "XML Configuration Usernames (<add key=\"usuario\" value=\"...\"/> or <add key=\"usuarioPMC\" value=\"...\"/>)"
+  },
+  {
+    "pattern": "(?i)<add[^>]*key\\s*=\\s*[\"']([^\"']*sshostKey[^\"']*)[\"'][^>]*value\\s*=\\s*[\"']([^\"']{10,})[\"']",
+    "secret_type": "SSH Host Key",
+    "description": "SSH Host Keys in XML Configuration (<add key=\"sshostKey\" value=\"...\"/>)"
+  },
+  {
+    "pattern": "(?i)([A-Za-z_][A-Za-z0-9_]*_PUBLIC_KEY)\\s*[=:]\\s*[\"']?([A-Za-z0-9_\\-/+=]{16,})[\"']?",
+    "secret_type": "Public Key",
+    "description": "Public Keys (pattern: *_PUBLIC_KEY) - MUST be before generic patterns"
+  },
+  {
+    "pattern": "(?i)([A-Za-z_][A-Za-z0-9_]*_PRIVATE_KEY)\\s*[=:]\\s*[\"']?([A-Za-z0-9_\\-/+=]{16,})[\"']?",
+    "secret_type": "Private Key",
+    "description": "Private Keys (pattern: *_PRIVATE_KEY) - MUST be before generic patterns"
+  },
+  {
+    "pattern": "(?i)([A-Za-z_][A-Za-z0-9_]*_(?:PASSWORD|PASSWD|PWD))\\s*[=:]\\s*[\"']?([A-Za-z0-9!@#$%^&*()_+\\-=\\[\\]{};':\"\\\\|,.<>\\/?]{8,})[\"']?",
+    "secret_type": "Password",
+    "description": "Passwords (pattern: *_PASSWORD, *_PASSWD, *_PWD)"
+  },
+  {
+    "pattern": "(?i)(aws[_-]?access[_-]?key[_-]?id|aws[_-]?secret[_-]?access[_-]?key)\\s*[=:]\\s*[\"']?(AKIA[0-9A-Z]{16})[\"']?",
+    "secret_type": "AWS Access Key",
+    "description": "AWS Access Keys (AKIA...)"
+  },
+  {
+    "pattern": "(?i)(aws[_-]?secret[_-]?access[_-]?key|aws[_-]?secret[_-]?key)\\s*[=:]\\s*[\"']?([A-Za-z0-9/+=]{40,})[\"']?",
+    "secret_type": "AWS Secret Key",
+    "description": "AWS Secret Keys (40+ characters, base64-like)"
+  },
+  {
+    "pattern": "(?i)(github[_-]?token|gh[_-]?token|ghp[_-]?token)\\s*[=:]\\s*[\"']?(ghp_[A-Za-z0-9]{36})[\"']?",
+    "secret_type": "GitHub Token",
+    "description": "GitHub Personal Access Token (ghp_...)"
+  },
+  {
+    "pattern": "(?i)(github[_-]?oauth[_-]?token|gho[_-]?token)\\s*[=:]\\s*[\"']?(gho_[A-Za-z0-9]{36})[\"']?",
+    "secret_type": "GitHub OAuth Token",
+    "description": "GitHub OAuth Token (gho_...)"
+  },
+  {
+    "pattern": "(?i)([A-Za-z_][A-Za-z0-9_]*(?:[Aa]pi[_-]?[Kk]ey|[Aa]pi[Kk]ey))\\s*[=:]\\s*[\"']?([A-Za-z0-9_\\-]{20,})[\"']?",
+    "secret_type": "API Key",
+    "description": "Generic API Keys (must be at least 20 chars)"
+  },
+  {
+    "pattern": "(?i)[\"']?(access[_-]?token|auth[_-]?token|bearer[_-]?token|token)[\"']?\\s*[=:]\\s*[\"']?([A-Za-z0-9_\\-\\.]{20,})[\"']?",
+    "secret_type": "Access Token",
+    "description": "Generic Tokens (must be at least 20 chars)",
+    "disabled": true
+  },
+  {
+    "pattern": "(?i)(jwt[_-]?token|json[_-]?web[_-]?token)\\s*[=:]\\s*[\"']?(eyJ[A-Za-z0-9\\-_]+\\.[A-Za-z0-9\\-_]+\\.[A-Za-z0-9\\-_]+)[\"']?",
+    "secret_type": "JWT Token",
+    "description": "JWT Tokens (eyJ...)"
+  },
+  {
+    "pattern": "(?i)(-----BEGIN\\s+(RSA\\s+)?PRIVATE\\s+KEY-----)",
+    "secret_type": "Private Key",
+    "description": "Private Keys (RSA, EC, etc.)"
+  },
+  {
+    "pattern": "(?i)(-----BEGIN\\s+(OPENSSH\\s+)?PRIVATE\\s+KEY-----)",
+    "secret_type": "SSH Private Key",
+    "description": "SSH Private Keys"
+  },
+  {
+    "pattern": "(?i)(-----BEGIN\\s+(RSA\\s+)?PUBLIC\\s+KEY-----)",
+    "secret_type": "Public Key",
+    "description": "Public Keys (less critical but still worth flagging)"
+  },
+  {
+    "pattern": "(?i)(google[_-]?api[_-]?key|gcp[_-]?api[_-]?key)\\s*[=:]\\s*[\"']?(AIza[0-9A-Za-z\\-_]{35})[\"']?",
+    "secret_type": "Google API Key",
+    "description": "Google API Keys (AIza...)"
+  },
+  {
+    "pattern": "(?i)(google[_-]?client[_-]?secret|gcp[_-]?client[_-]?secret)\\s*[=:]\\s*[\"']?([A-Za-z0-9_\\-]{24,})[\"']?",
+    "secret_type": "Google Client Secret",
+    "description": "Google OAuth Client Secret"
+  },
+  {
+    "pattern": "(?i)(stripe[_-]?secret[_-]?key|stripe[_-]?api[_-]?key)\\s*[=:]\\s*[\"']?(sk_(live|test)_[A-Za-z0-9]{24,})[\"']?",
+    "secret_type": "Stripe Secret Key",
+    "description": "Stripe API Keys (sk_live_... or sk_test_...)"
+  },
+  {
+    "pattern": "(?i)(stripe[_-]?publishable[_-]?key)\\s*[=:]\\s*[\"']?(pk_(live|test)_[A-Za-z0-9]{24,})[\"']?",
+    "secret_type": "Stripe Publishable Key",
+    "description": "Stripe Publishable Keys (pk_live_... or pk_test_...)"
+  },
+  {
+    "pattern": "(?i)(slack[_-]?token|slack[_-]?api[_-]?token)\\s*[=:]\\s*[\"']?(xox[baprs]-[A-Za-z0-9\\-]{10,})[\"']?",
+    "secret_type": "Slack Token",
+    "description": "Slack Tokens (xoxb-... or xoxp-...)"
+  },
+  {
+    "pattern": "(?i)(discord[_-]?bot[_-]?token|discord[_-]?token)\\s*[=:]\\s*[\"']?([A-Za-z0-9\\.\\-]{59,})[\"']?",
+    "secret_type": "Discord Bot Token",
+    "description": "Discord Bot Token"
+  },
+  {
+    "pattern": "(?i)[\"']?(secret[_-]?key|secret[_-]?access[_-]?key|app[_-]?secret)[\"']?\\s*[=:]\\s*[\"']?([A-Za-z0-9_\\-]{16,})[\"']?",
+    "secret_type": "Secret Key",
+    "description": "Generic Secret Keys (must be at least 16 chars)"
+  },
+  {
+    "pattern": "(?i)(mongodb[_-]?uri|postgres[_-]?uri|mysql[_-]?uri|database[_-]?uri|db[_-]?uri)\\s*[=:]\\s*[\"']?([a-z]+://[^\\s\"']+)[\"']?",
+    "secret_type": "Database URI",
+    "description": "Database Connection Strings"
+  },
+  {
+    "pattern": "(?i)[\"']?(credential|creds)[\"']?\\s*[=:]\\s*[\"']?([A-Za-z0-9_\\-]{16,})[\"']?",
+    "secret_type": "Credentials",
+    "description": "Generic Credentials"
+  },
+  {
+    "pattern": "(?i)(azure[_-]?storage[_-]?account[_-]?key|azure[_-]?storage[_-]?key)\\s*[=:]\\s*[\"']?([A-Za-z0-9+/=]{86}==)[\"']?",
+    "secret_type": "Azure Storage Key",
+    "description": "Azure Storage Account Keys"
+  },
+  {
+    "pattern": "(?i)(twilio[_-]?api[_-]?key|twilio[_-]?auth[_-]?token)\\s*[=:]\\s*[\"']?([A-Za-z0-9]{32})[\"']?",
+    "secret_type": "Twilio API Key",
+    "description": "Twilio API Keys"
+  },
+  {
+    "pattern": "(?i)(mailgun[_-]?api[_-]?key)\\s*[=:]\\s*[\"']?(key-[A-Za-z0-9]{32})[\"']?",
+    "secret_type": "Mailgun API Key",
+    "description": "Mailgun API Keys"
+  },
+  {
+    "pattern": "(?i)(sendgrid[_-]?api[_-]?key)\\s*[=:]\\s*[\"']?(SG\\.[A-Za-z0-9_\\-]{22}\\.[A-Za-z0-9_\\-]{43})[\"']?",
+    "secret_type": "SendGrid API Key",
+    "description": "SendGrid API Keys"
+  },
+  {
+    "pattern": "(?i)(example[_-]?pattern)\\s*[=:]\\s*[\"']?([A-Za-z0-9]{10,})[\"']?",
+    "secret_type": "Example Pattern",
+    "description": "Example pattern - disabled by default",
+    "disabled": true
+  }
+]
+

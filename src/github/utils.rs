@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use regex::Regex;
 use colored::Colorize;
 
@@ -80,6 +81,60 @@ pub fn extract_file_path(url: &str) -> String {
     
     // Fallback: return the last part of the URL
     cleaned.split("/").last().unwrap_or(&cleaned).to_string()
+}
+
+/// Get the file extension from a path or URL, normalized to lowercase with leading dot (e.g. ".rs").
+/// Returns an empty string if there is no extension.
+pub fn get_file_extension(path_or_url: &str) -> String {
+    let path = if path_or_url.contains("/blob/") || path_or_url.contains("raw.githubusercontent.com") {
+        extract_file_path(path_or_url)
+    } else {
+        path_or_url.split('/').last().unwrap_or(path_or_url).to_string()
+    };
+    path.rfind('.')
+        .map(|i| {
+            let ext = path[i..].to_lowercase();
+            if ext.starts_with('.') { ext } else { format!(".{}", ext) }
+        })
+        .unwrap_or_default()
+}
+
+/// Filter file URLs by include/exclude extensions. Extensions are normalized (e.g. ".rs" or "rs").
+pub fn filter_files_by_extension(
+    file_urls: &[String],
+    include_ext: Option<&[String]>,
+    exclude_ext: Option<&[String]>,
+    get_path: impl Fn(&str) -> String,
+) -> Vec<String> {
+    let normalize_ext = |s: &str| -> String {
+        let s = s.trim().to_lowercase();
+        if s.starts_with('.') { s } else if s.is_empty() { s } else { format!(".{}", s) }
+    };
+    let include_set: Option<HashSet<String>> = include_ext
+        .map(|v| v.iter().map(|s| normalize_ext(s)).collect());
+    let exclude_set: Option<HashSet<String>> = exclude_ext
+        .map(|v| v.iter().map(|s| normalize_ext(s)).collect());
+    file_urls
+        .iter()
+        .filter(|url| {
+            let ext = get_file_extension(&get_path(url));
+            if let Some(ref set) = include_set {
+                if set.is_empty() {
+                    return true;
+                }
+                if !set.contains(&ext) {
+                    return false;
+                }
+            }
+            if let Some(ref set) = exclude_set {
+                if set.contains(&ext) {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect()
 }
 
 /// Format text to fit within a specific width, wrapping if necessary
