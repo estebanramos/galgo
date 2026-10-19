@@ -154,6 +154,20 @@ Previously a missing token printed an error and exited `0`.
 
 ---
 
+## 5. Token handling
+
+- On start, stdout shows where the token came from and a safe hint of it
+  (`🔑 Token loaded from GITHUB_TOKEN environment variable (classic PAT, ends
+  in …1234)`). The token itself is never printed. When `--json` writes to
+  stdout, these lines go to stderr instead so the JSON stays clean.
+- The token is validated against `/rate_limit` (free, not counted) before any
+  search: `✅ Token OK, remaining quota: core 4990/5000, search 30/30`. An
+  invalid token now fails immediately with exit code 2.
+- Lookup order is unchanged: `GITHUB_TOKEN`, then the first line of
+  `./token.txt`. (The duplicated `token.txt` / `./token.txt` paths were merged.)
+- **No token rotation.** A single token is used; when it is rate limited the
+  run waits for the reset (see section 1) and aborts if the wait exceeds 120 s.
+
 ## Not done / known issues
 
 - **Exclusion regex** `["']\s*$` in `EXCLUSION_PATTERNS` ("empty or very short

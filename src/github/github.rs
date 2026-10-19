@@ -447,6 +447,18 @@ pub async fn search(
     Ok((repository_list, error_counter))
 }
 
+/// Validate the token and report the remaining quota. `/rate_limit` does not count against the limits.
+pub async fn check_token(token: &str) -> Result<String, GithubError> {
+    let json = get_json(token, "https://api.github.com/rate_limit", None, "rate limit").await
+        .map_err(|e| match e {
+            GithubError::InvalidResponse(m) if m.contains("status 401") => GithubError::InvalidResponse("Unauthorized: the token is invalid or expired".to_string()),
+            e => e,
+        })?;
+    let res = &json["resources"];
+    let part = |name: &str| format!("{} {}/{}", name, res[name]["remaining"], res[name]["limit"]);
+    Ok(format!("{}, {}", part("core"), part("search")))
+}
+
 /// Fetch a file through the contents API (raw media type: no JSON, no base64).
 pub async fn get_raw_file_content_from_api(url: String, token: &str) -> Result<String, GithubError> {
     let (status, body) = get_text(token, &clean_url(&url), Some("application/vnd.github.raw")).await?;

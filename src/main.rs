@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use clap::{CommandFactory, Parser};
 use colored::Colorize;
 use github::search;
-use token::get_token;
+use token::{describe_token, get_token};
 use crate::github::{list_repositories, run_scan, ScanMode, ScanOptions};
 
 mod github;
@@ -152,10 +152,21 @@ async fn main() {
         std::process::exit(2);
     };
 
-    let token = get_token().unwrap_or_else(|e| {
+    let (token, source) = get_token().unwrap_or_else(|e| {
         eprintln!("{}", e);
         std::process::exit(2);
     });
+    // stdout when it is free for humans; stderr when stdout carries JSON.
+    let json_on_stdout = matches!(&args.output.json, Some(None)) || matches!(&args.output.json, Some(Some(p)) if p.as_os_str() == "-");
+    let say = |msg: String| if json_on_stdout { eprintln!("{}", msg) } else { println!("{}", msg) };
+    say(format!("{} Token loaded from {} ({})", "🔑".green(), source.bold(), describe_token(&token)));
+    match github::check_token(&token).await {
+        Ok(quota) => say(format!("{} Token OK, remaining quota: {}", "✅".green(), quota)),
+        Err(e) => {
+            eprintln!("{} {}", "❌ Token check failed:".red(), e);
+            std::process::exit(2);
+        }
+    }
     eprintln!("{} {}", "⏳ Processing:".green(), args.search.domain);
     let (repos, error_counter) = match search(&token, &args.search.domain, args.search.max_repos, args.analysis.include_ext.clone()).await {
         Ok(r) => r,

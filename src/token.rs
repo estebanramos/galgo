@@ -20,45 +20,31 @@ impl fmt::Display for TokenError {
 
 impl std::error::Error for TokenError {}
 
-pub fn get_token() -> Result<String, TokenError> {
+/// Returns the token and a description of where it came from (never the token itself).
+pub fn get_token() -> Result<(String, &'static str), TokenError> {
     if let Ok(token) = std::env::var("GITHUB_TOKEN") {
         let token = token.trim().to_string();
         if !token.is_empty() {
-            return Ok(token);
+            return Ok((token, "GITHUB_TOKEN environment variable"));
         }
     }
-    read_token_from_file()
+    read_token_from_file().map(|t| (t, "./token.txt"))
 }
 
 pub fn read_token_from_file() -> Result<String, TokenError> {
-    // Try multiple possible locations for token.txt
-    let possible_paths = [
-        "token.txt",
-        "./token.txt",
-    ];
-    
-    let mut last_error = None;
-    for path in &possible_paths {
-        match File::open(path) {
-            Ok(file) => {
-                let mut reader = BufReader::new(file);
-                let mut token = String::new();
-                match reader.read_line(&mut token) {
-                    Ok(_) => {
-                        let token = token.trim().to_string();
-                        if !token.is_empty() {
-                            return Ok(token);
-                        }
-                    }
-                    Err(e) => {
-                        last_error = Some(TokenError::IoError(e));
-                        continue;
-                    }
-                }
-            }
-            Err(_) => continue,
-        }
-    }
-    
-    Err(last_error.unwrap_or(TokenError::FileNotFound))
+    let file = File::open("token.txt").map_err(|_| TokenError::FileNotFound)?;
+    let mut token = String::new();
+    BufReader::new(file).read_line(&mut token).map_err(TokenError::IoError)?;
+    let token = token.trim().to_string();
+    if token.is_empty() { Err(TokenError::FileNotFound) } else { Ok(token) }
+}
+
+/// Safe-to-print hint of a token: its kind and last 4 characters.
+pub fn describe_token(token: &str) -> String {
+    let kind = if token.starts_with("github_pat_") { "fine-grained PAT" }
+        else if token.starts_with("ghp_") { "classic PAT" }
+        else if token.starts_with("gho_") || token.starts_with("ghu_") || token.starts_with("ghs_") { "app/OAuth token" }
+        else { "token" };
+    let tail: String = token.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    format!("{}, ends in …{}", kind, tail)
 }
