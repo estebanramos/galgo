@@ -5,7 +5,7 @@ edition = "2021"
 description = "A security tool for scanning GitHub repositories to detect exposed secrets"
 authors = ["Your Name <your.email@example.com>"]
 license = "MIT"
-repository = "https://github.com/yourusername/galgo"
+repository = "https://github.com/estebanramos/galgo"
 keywords = ["security", "github", "secrets", "scanner"]
 categories = ["security"]
 
