@@ -407,6 +407,7 @@ pub struct RepoReport {
 #[derive(Serialize)]
 pub struct FileEntry {
     pub path: String,
+    pub url: String,
     /// "scanned", "skipped" (ignored extension) or "failed" (could not be fetched)
     pub status: &'static str,
     pub findings: usize,
@@ -546,12 +547,13 @@ async fn scan_single(repo: &Repository, token: &TokenPool, counter: &super::gith
         report.languages = l.map(language_shares).unwrap_or_default();
     }
     for (path, outcome) in files {
+        let url = repo.files_urls.iter().find(|u| extract_file_path(u) == path).map(|u| clean_url(u)).unwrap_or_default();
         let (status, findings) = match &outcome {
             FileOutcome::Scanned(o) => ("scanned", o.findings.len()),
             FileOutcome::Skipped => ("skipped", 0),
             FileOutcome::Failed => ("failed", 0),
         };
-        report.files.push(FileEntry { path: path.clone(), status, findings });
+        report.files.push(FileEntry { path: path.clone(), url, status, findings });
         report.merge(&path, outcome);
     }
     report.sort_findings();
@@ -646,14 +648,22 @@ fn short_name(url: &str) -> &str {
 /// One-line result for repos that do not deserve a box.
 fn print_line(r: &RepoReport) {
     match r.status {
-        "skipped" => println!("{} {}  {}", "⏭ ".dimmed(), short_name(&r.repository).dimmed(), r.note.as_deref().unwrap_or("").dimmed()),
-        "error" => println!("{} {}  {}", "✗".red().bold(), short_name(&r.repository), r.note.as_deref().unwrap_or("").red()),
+        "skipped" => println!("{} {}  {}", "⏭ ".dimmed(), link(short_name(&r.repository), &r.repository).dimmed(), r.note.as_deref().unwrap_or("").dimmed()),
+        "error" => println!("{} {}  {}", "✗".red().bold(), link(short_name(&r.repository), &r.repository), r.note.as_deref().unwrap_or("").red()),
         _ => {
             let stars = r.stars.map(|s| format!("★ {}  ", compact_count(s))).unwrap_or_default();
-            println!("{} {}  {}{}", "✓".green(), short_name(&r.repository), stars.yellow(), format!("{} file(s) scanned, no secrets", r.files_scanned).dimmed());
+            println!("{} {}  {}{}", "✓".green(), link(short_name(&r.repository), &r.repository), stars.yellow(), format!("{} file(s) scanned, no secrets", r.files_scanned).dimmed());
             print_files(r);
         }
     }
+}
+
+/// Clickable terminal hyperlink (OSC 8); plain text when output is piped or colors are off.
+fn link(text: &str, url: &str) -> String {
+    if url.is_empty() || !console::Term::stdout().is_term() || !colored::control::SHOULD_COLORIZE.should_colorize() {
+        return text.to_string();
+    }
+    format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
 }
 
 fn file_label(f: &FileEntry) -> String {
@@ -669,7 +679,7 @@ fn file_label(f: &FileEntry) -> String {
 fn print_files(r: &RepoReport) {
     const SHOWN: usize = 5;
     for f in r.files.iter().take(SHOWN) {
-        println!("    {} {}  {}", "↳".dimmed(), f.path, file_label(f).dimmed());
+        println!("    {} {}  {}", "↳".dimmed(), link(&f.path, &f.url), file_label(f).dimmed());
     }
     if r.files.len() > SHOWN {
         println!("    {}", format!("… +{} more matching file(s)", r.files.len() - SHOWN).dimmed());
@@ -722,7 +732,7 @@ fn print_report(r: &RepoReport, index: usize, total: usize, w: usize) {
         if !r.matched_files.is_empty() { row("📝 Files", &r.matched_files.join(", ")); }
     } else {
         for f in &r.files {
-            row("📝 Matched file", &format!("{}  [{}]", f.path, file_label(f)));
+            println!("│ 📝 Matched file: {}  [{}]", link(&f.path, &f.url), file_label(f));
         }
     }
     row("📊 Scanned", &format!("{} file(s)", r.files_scanned));
@@ -739,7 +749,7 @@ fn print_report(r: &RepoReport, index: usize, total: usize, w: usize) {
         row("🚨 Secrets Found", &format!("{} potential secret(s)", r.findings.len()));
         for f in &r.findings {
             let what = if f.variable != "unknown" { format!("{}: {}", f.variable.bold().cyan(), f.secret_type) } else { f.secret_type.clone() };
-            println!("│   [{}] {}:{} ({}) {}", f.severity.label(), middle(&f.file, w.saturating_sub(40).max(20)).bold().yellow(), f.line, what, f.value.dimmed());
+            println!("│   [{}] {}:{} ({}) {}", f.severity.label(), link(&middle(&f.file, w.saturating_sub(40).max(20)), &f.url).bold().yellow(), f.line, what, f.value.dimmed());
         }
     }
     if !r.env_references.is_empty() {
@@ -854,7 +864,7 @@ fn print_findings_summary(reports: &[RepoReport], w: usize) {
     println!("{}", format!("  🚨 {} finding(s), highest severity first", all.len()).bold().red());
     println!("{}", "═".repeat(w).cyan());
     for (r, f) in all {
-        println!("[{:^6}] {}  {}", f.severity.label(), short_name(&r.repository).bold(), format!("{}:{}", middle(&f.file, w.saturating_sub(45).max(20)), f.line).yellow());
+        println!("[{:^6}] {}  {}", f.severity.label(), link(short_name(&r.repository), &r.repository).bold(), link(&format!("{}:{}", middle(&f.file, w.saturating_sub(45).max(20)), f.line), &f.url).yellow());
         println!("         {} {}", f.secret_type, f.value.dimmed());
     }
     println!();
