@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use clap::{CommandFactory, Parser};
 use colored::Colorize;
 use github::search;
-use token::{describe_token, get_token};
+use token::{describe_token, get_tokens, TokenPool};
 use crate::github::{list_repositories, run_scan, ScanMode, ScanOptions};
 
 mod github;
@@ -152,21 +152,37 @@ async fn main() {
         std::process::exit(2);
     };
 
-    let (token, source) = get_token().unwrap_or_else(|e| {
+    let (tokens, source) = get_tokens().unwrap_or_else(|e| {
         eprintln!("{}", e);
         std::process::exit(2);
     });
     // stdout when it is free for humans; stderr when stdout carries JSON.
     let json_on_stdout = matches!(&args.output.json, Some(None)) || matches!(&args.output.json, Some(Some(p)) if p.as_os_str() == "-");
     let say = |msg: String| if json_on_stdout { eprintln!("{}", msg) } else { println!("{}", msg) };
-    say(format!("{} Token loaded from {} ({})", "🔑".green(), source.bold(), describe_token(&token)));
-    match github::check_token(&token).await {
-        Ok(quota) => say(format!("{} Token OK, remaining quota: {}", "✅".green(), quota)),
-        Err(e) => {
-            eprintln!("{} {}", "❌ Token check failed:".red(), e);
-            std::process::exit(2);
+    say(format!("{} {} token(s) loaded from {}", "🔑".green(), tokens.len(), source.bold()));
+    let mut valid: Vec<String> = Vec::new();
+    let mut logins: Vec<String> = Vec::new();
+    for (i, t) in tokens.iter().enumerate() {
+        let label = format!("#{} ({})", i + 1, describe_token(t));
+        match github::check_token(t).await {
+            Ok((login, quota)) => {
+                say(format!("   {} {} {}: {}", "✅".green(), label, login.as_deref().map(|l| format!("@{}", l)).unwrap_or_default(), quota));
+                if let Some(l) = login {
+                    if logins.contains(&l) {
+                        say(format!("   {} {} belongs to the same account as an earlier token: the search limit is per account, so it will not add search capacity", "⚠️".yellow(), label));
+                    }
+                    logins.push(l);
+                }
+                valid.push(t.clone());
+            }
+            Err(e) => say(format!("   {} {}: {}", "❌".red(), label, e)),
         }
     }
+    if valid.is_empty() {
+        eprintln!("{}", "❌ No valid token available".red());
+        std::process::exit(2);
+    }
+    let token = TokenPool::new(valid);
     eprintln!("{} {}", "⏳ Processing:".green(), args.search.domain);
     let (repos, error_counter) = match search(&token, &args.search.domain, args.search.max_repos, args.analysis.include_ext.clone()).await {
         Ok(r) => r,

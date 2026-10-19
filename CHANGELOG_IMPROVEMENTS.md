@@ -154,19 +154,40 @@ Previously a missing token printed an error and exited `0`.
 
 ---
 
-## 5. Token handling
+## 5. Token handling and rotation
 
-- On start, stdout shows where the token came from and a safe hint of it
-  (`🔑 Token loaded from GITHUB_TOKEN environment variable (classic PAT, ends
-  in …1234)`). The token itself is never printed. When `--json` writes to
-  stdout, these lines go to stderr instead so the JSON stays clean.
-- The token is validated against `/rate_limit` (free, not counted) before any
-  search: `✅ Token OK, remaining quota: core 4990/5000, search 30/30`. An
-  invalid token now fails immediately with exit code 2.
-- Lookup order is unchanged: `GITHUB_TOKEN`, then the first line of
-  `./token.txt`. (The duplicated `token.txt` / `./token.txt` paths were merged.)
-- **No token rotation.** A single token is used; when it is rate limited the
-  run waits for the reset (see section 1) and aborts if the wait exceeds 120 s.
+### Sources
+First source that yields a token wins; each accepts several tokens separated by
+commas, spaces or newlines (`#` comment lines and duplicates are ignored):
+
+1. `GITHUB_TOKENS`
+2. `GITHUB_TOKEN`
+3. `./token.txt` (one token per line)
+
+### Startup report (stdout; stderr when `--json` writes to stdout)
+```
+🔑 2 token(s) loaded from GITHUB_TOKENS environment variable
+   ✅ #1 (classic PAT, ends in …1234) @alice: core 4990/5000, search 30/30
+   ✅ #2 (fine-grained PAT, ends in …abcd) @bob: core 5000/5000, search 30/30
+```
+Tokens are never printed, only their kind and last 4 characters. Each one is
+validated against `/rate_limit` (free) and `/user`. Invalid tokens are dropped
+with a message; if none is valid the run exits with code 2. Two tokens of the
+same account trigger a warning, because the search limit is per account and
+they add no search capacity.
+
+### Rotation (`TokenPool` in `src/token.rs`)
+- The current token is used until it is rate limited; then the request moves to
+  the next free token and a `🔁 Token #n rate limited, rotating` line is printed
+  once.
+- Limits are tracked per token **and per bucket** (search vs. everything else),
+  so a token exhausted on `core` still serves search requests.
+- A response whose `X-RateLimit-Remaining` is 0 parks that token immediately,
+  avoiding one failed request.
+- When every token is limited, the run waits for the soonest reset (max 120 s,
+  3 times) and aborts with exit code 2 if that is not enough. With one token
+  this is the previous behaviour.
+- The pool is passed where `token: &str` used to be, so no call sites changed.
 
 ## Not done / known issues
 

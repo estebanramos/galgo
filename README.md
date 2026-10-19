@@ -28,6 +28,8 @@ cargo install --path .
 
 # 2. Set your GitHub token (required)
 export GITHUB_TOKEN="ghp_xxxxxxxxxxxx"
+# optional: several tokens (different accounts) are rotated when one hits the rate limit
+# export GITHUB_TOKENS="ghp_aaa,ghp_bbb"   # or one token per line in ./token.txt
 
 # 3. Run (pick one mode)
 galgo -d example.com -s          # single-file: analyze only files that mention example.com

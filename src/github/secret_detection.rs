@@ -1,3 +1,4 @@
+use crate::token::TokenPool;
 use super::Repository;
 use std::collections::HashMap;
 use std::io::Write;
@@ -490,7 +491,7 @@ where
 }
 
 /// Single-file mode: analyze only the files that matched the search.
-async fn scan_single(repo: &Repository, token: &str, counter: &super::github::HttpErrorCounter, reveal: bool) -> RepoReport {
+async fn scan_single(repo: &Repository, token: &TokenPool, counter: &super::github::HttpErrorCounter, reveal: bool) -> RepoReport {
     use super::github::{extract_repo_info, get_repo_metadata, get_repo_languages, get_raw_file_content_from_api};
     const MAX_CONCURRENT_FILE_REQUESTS: usize = 30;
 
@@ -524,7 +525,7 @@ async fn scan_single(repo: &Repository, token: &str, counter: &super::github::Ht
 }
 
 /// Whole-repo mode: fetch the file tree and scan the config-like files.
-async fn scan_whole(repo: &Repository, token: &str, domain: &str, counter: &super::github::HttpErrorCounter, max_files: Option<usize>, reveal: bool, mp: &indicatif::MultiProgress) -> RepoReport {
+async fn scan_whole(repo: &Repository, token: &TokenPool, domain: &str, counter: &super::github::HttpErrorCounter, max_files: Option<usize>, reveal: bool, mp: &indicatif::MultiProgress) -> RepoReport {
     use super::github::{extract_repo_info, get_repo_metadata, should_scan_repository, get_repo_files_recursive, get_file_content_by_sha};
     use indicatif::{ProgressBar, ProgressStyle};
     const MAX_CONCURRENT_FILE_REQUESTS: usize = 40;
@@ -700,7 +701,7 @@ pub struct ScanOptions {
 
 /// Scan every repository and report. Boxes (or JSON) go to stdout, headers and summaries to stderr.
 /// Returns the total number of findings.
-pub async fn run_scan(result: HashMap<String, Repository>, token: &str, error_counter: super::github::HttpErrorCounter, opts: ScanOptions) -> usize {
+pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, error_counter: super::github::HttpErrorCounter, opts: ScanOptions) -> usize {
     let mut repos: Vec<Repository> = result.into_values().collect();
     let key = |r: &Repository| repo_sort_date(r, &opts.commit_date_kind);
     match opts.sort_order.as_str() {

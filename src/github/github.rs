@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use colored::Colorize;
 use once_cell::sync::Lazy;
+use crate::token::{Bucket, Pick, TokenPool};
 use super::utils::{clean_file_name, clean_url, extract_file_path};
 use chrono::{DateTime, Utc};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -172,12 +173,30 @@ fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 }
 
 /// GET `url` and return `(status, body)`.
-/// Primary and secondary rate limits are handled here, once for every endpoint:
-/// the request sleeps until the window resets (up to `MAX_RATE_LIMIT_WAIT_SECS`) and is retried.
-pub async fn get_text(token: &str, url: &str, accept: Option<&str>) -> Result<(u16, String), GithubError> {
-    let mut attempt = 0;
+/// Rate limits are handled here, once for every endpoint: when a token is limited the request moves to the
+/// next free token of the pool; when all are limited it sleeps until the first one resets
+/// (up to `MAX_RATE_LIMIT_WAIT_SECS`, `MAX_RATE_LIMIT_RETRIES` times) and retries.
+pub async fn get_text(pool: &TokenPool, url: &str, accept: Option<&str>) -> Result<(u16, String), GithubError> {
+    let bucket = if url.contains("/search/") { Bucket::Search } else { Bucket::Core };
+    let mut sleeps = 0;
     loop {
-        let mut req = CLIENT.get(url).bearer_auth(token);
+        let (index, token) = match pool.pick(bucket) {
+            Pick::Ready(i, t) => (i, t),
+            Pick::AllLimited(wait) => {
+                let secs = wait.as_secs() + 1;
+                if sleeps >= MAX_RATE_LIMIT_RETRIES || secs > MAX_RATE_LIMIT_WAIT_SECS {
+                    return Err(GithubError::RateLimitExceeded(format!(
+                        "GitHub API rate limit exceeded on all {} token(s) (next reset in {}s)", pool.len(), secs
+                    )));
+                }
+                sleeps += 1;
+                eprintln!("{}", format!("⏳ All {} token(s) rate limited, waiting {}s (retry {}/{})...", pool.len(), secs, sleeps, MAX_RATE_LIMIT_RETRIES).yellow());
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                continue;
+            }
+        };
+
+        let mut req = CLIENT.get(url).bearer_auth(&token);
         if let Some(a) = accept {
             req = req.header("Accept", a);
         }
@@ -189,24 +208,23 @@ pub async fn get_text(token: &str, url: &str, accept: Option<&str>) -> Result<(u
         let limited = status == 429
             || (status == 403 && (wait.is_some() || body.to_lowercase().contains("rate limit")));
         if !limited {
+            // A token that just spent its last request is parked now instead of costing a failed one later.
+            if let (true, Some(secs)) = (status < 300, wait) {
+                pool.mark_limited(index, bucket, Duration::from_secs(secs));
+            }
             return Ok((status, body));
         }
 
         // shortcut: secondary limits without a header wait a flat 60s, upgrade if GitHub documents a better signal.
         let secs = wait.unwrap_or(60);
-        if attempt >= MAX_RATE_LIMIT_RETRIES || secs > MAX_RATE_LIMIT_WAIT_SECS {
-            return Err(GithubError::RateLimitExceeded(format!(
-                "GitHub API rate limit exceeded (resets in {}s). Response: {}", secs, body
-            )));
+        if pool.mark_limited(index, bucket, Duration::from_secs(secs)) && pool.len() > 1 {
+            eprintln!("{}", format!("🔁 Token #{} rate limited (resets in {}s), rotating", index + 1, secs).yellow());
         }
-        attempt += 1;
-        eprintln!("{}", format!("⏳ Rate limited, waiting {}s (retry {}/{})...", secs, attempt, MAX_RATE_LIMIT_RETRIES).yellow());
-        tokio::time::sleep(Duration::from_secs(secs)).await;
     }
 }
 
 /// GET and parse a JSON body; any non-2xx status becomes `InvalidResponse("Failed to get <what>: status N")`.
-async fn get_json(token: &str, url: &str, accept: Option<&str>, what: &str) -> Result<Value, GithubError> {
+async fn get_json(token: &TokenPool, url: &str, accept: Option<&str>, what: &str) -> Result<Value, GithubError> {
     let (status, body) = get_text(token, url, accept).await?;
     if !(200..300).contains(&status) {
         return Err(GithubError::InvalidResponse(format!("Failed to get {}: status {}", what, status)));
@@ -219,7 +237,7 @@ async fn get_json(token: &str, url: &str, accept: Option<&str>, what: &str) -> R
 /// max_repos: Optional limit on number of unique repositories to return (None = unlimited, up to API limits)
 /// include_ext: When set, the GitHub Code Search API is restricted to these file extensions (e.g. ["rs", "toml"]).
 pub async fn search(
-    token: &str,
+    token: &TokenPool,
     domain: &str,
     max_repos: Option<usize>,
     include_ext: Option<Vec<String>>,
@@ -447,20 +465,24 @@ pub async fn search(
     Ok((repository_list, error_counter))
 }
 
-/// Validate the token and report the remaining quota. `/rate_limit` does not count against the limits.
-pub async fn check_token(token: &str) -> Result<String, GithubError> {
-    let json = get_json(token, "https://api.github.com/rate_limit", None, "rate limit").await
+/// Validate one token and report its account and remaining quota. `/rate_limit` does not count against the limits.
+/// Returns `(login, quota)`; the login is how callers spot several tokens belonging to the same account.
+pub async fn check_token(token: &str) -> Result<(Option<String>, String), GithubError> {
+    let pool = TokenPool::new(vec![token.to_string()]);
+    let json = get_json(&pool, "https://api.github.com/rate_limit", None, "rate limit").await
         .map_err(|e| match e {
             GithubError::InvalidResponse(m) if m.contains("status 401") => GithubError::InvalidResponse("Unauthorized: the token is invalid or expired".to_string()),
             e => e,
         })?;
     let res = &json["resources"];
     let part = |name: &str| format!("{} {}/{}", name, res[name]["remaining"], res[name]["limit"]);
-    Ok(format!("{}, {}", part("core"), part("search")))
+    let login = get_json(&pool, "https://api.github.com/user", None, "user").await.ok()
+        .and_then(|u| u["login"].as_str().map(String::from));
+    Ok((login, format!("{}, {}", part("core"), part("search"))))
 }
 
 /// Fetch a file through the contents API (raw media type: no JSON, no base64).
-pub async fn get_raw_file_content_from_api(url: String, token: &str) -> Result<String, GithubError> {
+pub async fn get_raw_file_content_from_api(url: String, token: &TokenPool) -> Result<String, GithubError> {
     let (status, body) = get_text(token, &clean_url(&url), Some("application/vnd.github.raw")).await?;
     if !(200..300).contains(&status) {
         return Err(GithubError::InvalidResponse(format!("Failed to get raw file content: status {}", status)));
@@ -469,7 +491,7 @@ pub async fn get_raw_file_content_from_api(url: String, token: &str) -> Result<S
 }
 
 /// Fetches the date of the last commit. If `path` is Some, requests commits for that file only (last commit that touched the file).
-pub async fn get_last_commit_date(token: &str, mut url: String, path: Option<&str>) -> Result<DateTime<Utc>, GithubError> {
+pub async fn get_last_commit_date(token: &TokenPool, mut url: String, path: Option<&str>) -> Result<DateTime<Utc>, GithubError> {
     if let Some(p) = path.filter(|p| !p.is_empty()) {
         url.push_str("?path=");
         url.push_str(&urlencoding::encode(p));
@@ -513,7 +535,7 @@ pub struct RepoMetadata {
 }
 
 /// Get repository metadata (branch, description, topics, etc.) in a single request
-pub async fn get_repo_metadata(token: &str, owner: &str, repo: &str) -> Result<RepoMetadata, GithubError> {
+pub async fn get_repo_metadata(token: &TokenPool, owner: &str, repo: &str) -> Result<RepoMetadata, GithubError> {
     let url = format!("https://api.github.com/repos/{}/{}", owner, repo);
     let json = get_json(token, &url, None, "repo info").await?;
 
@@ -628,7 +650,7 @@ pub fn should_scan_repository(metadata: &RepoMetadata, domain: &str) -> (bool, O
 
 
 /// Get all files in a repository recursively
-pub async fn get_repo_files_recursive(token: &str, owner: &str, repo: &str, branch: &str) -> Result<Vec<(String, String)>, GithubError> {
+pub async fn get_repo_files_recursive(token: &TokenPool, owner: &str, repo: &str, branch: &str) -> Result<Vec<(String, String)>, GithubError> {
     // Use Git Trees API with recursive=1 to get all files
     let url = format!("https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1", owner, repo, branch);
     let json = get_json(token, &url, None, "repo tree").await?;
@@ -643,7 +665,7 @@ pub async fn get_repo_files_recursive(token: &str, owner: &str, repo: &str, bran
 }
 
 /// Get file content by SHA
-pub async fn get_file_content_by_sha(token: &str, owner: &str, repo: &str, sha: &str) -> Result<String, GithubError> {
+pub async fn get_file_content_by_sha(token: &TokenPool, owner: &str, repo: &str, sha: &str) -> Result<String, GithubError> {
     let url = format!("https://api.github.com/repos/{}/{}/git/blobs/{}", owner, repo, sha);
     let json = get_json(token, &url, None, "file content").await?;
 
@@ -663,7 +685,7 @@ pub async fn get_file_content_by_sha(token: &str, owner: &str, repo: &str, sha: 
 }
 
 /// Language name -> bytes of code.
-pub async fn get_repo_languages(token: &str, owner: &str, repo: &str) -> Result<HashMap<String, u64>, GithubError> {
+pub async fn get_repo_languages(token: &TokenPool, owner: &str, repo: &str) -> Result<HashMap<String, u64>, GithubError> {
     let url = format!("https://api.github.com/repos/{}/{}/languages", owner, repo);
     let json = get_json(token, &url, None, "languages").await?;
     serde_json::from_value(json).map_err(|e| GithubError::InvalidResponse(format!("Failed to parse languages: {}", e)))
