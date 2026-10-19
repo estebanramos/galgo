@@ -12,7 +12,7 @@ pub enum TokenError {
 impl fmt::Display for TokenError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TokenError::FileNotFound => write!(f, "{}", "❌ token.txt not found".red()),
+            TokenError::FileNotFound => write!(f, "{}", "❌ No GitHub token found: set GITHUB_TOKEN or put it in ./token.txt".red()),
             TokenError::IoError(e) => write!(f, "IO error: {}", e),
         }
     }
@@ -21,19 +21,12 @@ impl fmt::Display for TokenError {
 impl std::error::Error for TokenError {}
 
 pub fn get_token() -> Result<String, TokenError> {
-    println!("{}", "🔑 Trying to read token from environment variable".yellow());
-    match std::env::var("GITHUB_TOKEN") {
-        Ok(token) => {
-            let token = token.trim().to_string();
-            if !token.is_empty() {
-                return Ok(token);
-            }
-        }
-        Err(_) => {
-            println!("{}", "⚠️  GITHUB_TOKEN environment variable not found".yellow());
+    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
         }
     }
-    println!("{}", "🔑 Trying to read token from token.txt".yellow());
     read_token_from_file()
 }
 

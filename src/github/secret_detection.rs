@@ -138,750 +138,598 @@ fn is_interesting_config_file(path: &str) -> bool {
     NAME_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
-pub async fn single_file_detection_with_regex(result: HashMap<String, Repository>, token: &str, error_counter: super::github::HttpErrorCounter, sort_order: &str, commit_date_kind: &str, quiet: bool) {
-    const BOX_WIDTH: usize = 80;
-    
-    // Convert HashMap to Vec and sort by selected commit date (file or repo)
-    let mut repos: Vec<(String, Repository)> = result.into_iter().collect();
-    let kind = if commit_date_kind == "repo" { "repo" } else { "file" };
-    match sort_order {
-        "asc" => repos.sort_by(|a, b| repo_sort_date(&a.1, commit_date_kind).cmp(&repo_sort_date(&b.1, commit_date_kind))),
-        "desc" => repos.sort_by(|a, b| repo_sort_date(&b.1, commit_date_kind).cmp(&repo_sort_date(&a.1, commit_date_kind))),
-        _ => {}
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    Low,
+    Medium,
+    High,
+}
+
+impl Severity {
+    fn of(secret_type: &str) -> Self {
+        match secret_type {
+            "Public Key" | "Stripe Publishable Key" | "SSH Host Key" | "Example Pattern" => Severity::Low,
+            "XML Username" | "API Key" | "Google API Key" | "Access Token" => Severity::Medium,
+            _ => Severity::High,
+        }
     }
-    
-    let total_repos = repos.len();
-    let mut index = 1;
-    
-    println!("\n{}", "─".repeat(BOX_WIDTH).cyan());
-    println!("{}", format!("  🔍 Analyzing {} repositories for secrets", total_repos).bold().cyan());
-    println!("{}", format!("  📊 Sorted by {} commit date: {} ({} first)", 
-        kind,
-        if sort_order == "asc" { "Ascending" } else { "Descending" },
-        if sort_order == "asc" { "oldest" } else { "newest" }
-    ).bold().cyan());
-    println!("{}\n", "─".repeat(BOX_WIDTH).cyan());
-    
-    for (_, repo) in repos {
-        let repo_url = repo.repository_url.clone();
-        let mut skipped_files = 0;
-        let mut skipped_files_extensions: Vec<String> = Vec::new();
-        let mut secrets_found: Vec<(String, String, String)> = Vec::new(); // (file_path, variable_name, secret_type)
+
+    fn label(self) -> colored::ColoredString {
+        match self {
+            Severity::Low => "LOW".blue(),
+            Severity::Medium => "MEDIUM".yellow(),
+            Severity::High => "HIGH".red().bold(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Finding {
+    pub file: String,
+    pub line: usize,
+    pub variable: String,
+    pub secret_type: String,
+    pub severity: Severity,
+    /// Masked unless `--show-secrets` is given.
+    pub value: String,
+    /// Link to the exact line on GitHub.
+    pub url: String,
+}
+
+/// A match on a line that reads its value from the environment (`process.env`, `${VAR}`...): not a leaked secret.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvReference {
+    pub file: String,
+    pub line: usize,
+    pub text: String,
+}
+
+#[derive(Default)]
+pub struct ScanOutput {
+    pub findings: Vec<Finding>,
+    pub env_references: Vec<EnvReference>,
+}
+
+fn mask(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    if chars.len() <= 8 {
+        "****".to_string()
+    } else {
+        format!("{}****{}", chars[..2].iter().collect::<String>(), chars[chars.len() - 2..].iter().collect::<String>())
+    }
+}
+
+static ENV_PLACEHOLDER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r"\$\{\w+\}").unwrap());
+
+/// Best-effort variable name for a match: the first capture group when it looks like an identifier,
+/// otherwise inferred from the line.
+fn extract_var_name(captures: &regex::Captures, secret_type: &str, line: &str, line_start: usize, match_start: usize) -> String {
+    captures.get(1)
+    .map(|m| {
+        let captured = m.as_str().trim_matches(|c| c == '"' || c == '\'').to_string();
+        // Check if this is an XML pattern (contains "<add" in the pattern)
+        let is_xml_pattern = secret_type.contains("XML");
         
-        // Analyze files for secrets in parallel FIRST (before printing anything)
-        use super::github::get_raw_file_content_from_api;
-        use std::sync::Arc;
-        use tokio::sync::Semaphore;
-        use futures::future::join_all;
-        
-        const MAX_CONCURRENT_FILE_REQUESTS: usize = 30; // Increased for better parallel processing
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_REQUESTS));
-        let error_counter_arc = Arc::new(error_counter.clone());
-        let token_arc = Arc::new(token.to_string());
-        
-        let file_futures: Vec<_> = repo.files_urls_api.iter().map(|url| {
-            let url_clone = url.clone();
-            let url_clean = clean_url(url);
-            let semaphore_clone = semaphore.clone();
-            let error_counter_clone = error_counter_arc.clone();
-            let token_clone = token_arc.clone();
+        if is_xml_pattern {
+            // For XML patterns, the key name is what we want to show
+            // Allow it even if it's a keyword (like "passwd", "usuario")
+            if captured.chars().any(|c| c.is_alphanumeric() || c == '_')
+                && captured.len() < 100 {
+                captured
+            } else {
+                "unknown".to_string()
+            }
+        } else {
+            // For non-XML patterns, filter out keywords
+            let keywords = ["api", "key", "apikey", "password", "passwd", "pwd", "token", "secret"];
+            let captured_lower = captured.to_lowercase();
             
-            async move {
-                if FILES_EXTENSIONS.iter().any(|ext| url_clean.ends_with(ext)) {
-                    return (None, true, url_clean.clone());
-                }
-                let _permit = semaphore_clone.acquire().await.unwrap();
-                let api_result = get_raw_file_content_from_api(url_clone.clone(), &token_clone).await;
-                match api_result {
-                    Ok(content) => {
-                        let mut found_patterns = Vec::new();
-                        
-                        // Check for secrets and capture variable names
-                        // IMPORTANT: Check ALL patterns to find ALL secrets in the file
-                        for (pattern, secret_type) in PATTERNS.iter() {
-                            // Use find_iter to find ALL matches of this pattern in the content
-                            let content_str = content.as_str();
-                            for captures in pattern.captures_iter(content_str) {
-                                    // Check exclusion patterns per-match line, not per-file
-                                    let match_start_check = captures.get(0).map(|m| m.start()).unwrap_or(0);
-                                    let line_start_check = content_str[..match_start_check].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                    let line_end_check = content_str[match_start_check..].find('\n').map(|i| match_start_check + i).unwrap_or(content_str.len());
-                                    let match_line = &content_str[line_start_check..line_end_check];
-                                    // Never exclude lines that look like XML config (<add key="..." value="...">)
-                                    let looks_like_xml_config = match_line.contains("<add")
-                                        && match_line.contains("key=")
-                                        && match_line.contains("value=");
-                                    let is_excluded = !looks_like_xml_config
-                                        && EXCLUSION_PATTERNS.iter().any(|exclusion| {
-                                            exclusion.is_match(match_line)
-                                        });
-                                    if is_excluded {
-                                        continue;
-                                    }
-                                    // Extract the line containing the match
-                                    let match_start = captures.get(0).map(|m| m.start()).unwrap_or(0);
-                                    let line_start = content_str[..match_start].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                    let line_end = content_str[match_start..].find('\n').map(|i| match_start + i).unwrap_or(content_str.len());
-                                    let line = &content_str[line_start..line_end];
-                                    
-                                    // Try to get variable name from first capture group (if pattern captures it)
-                                    let var_name = captures.get(1)
-                                        .map(|m| {
-                                            let captured = m.as_str().trim_matches(|c| c == '"' || c == '\'').to_string();
-                                            // Check if this is an XML pattern (contains "<add" in the pattern)
-                                            let is_xml_pattern = secret_type.contains("XML");
-                                            
-                                            if is_xml_pattern {
-                                                // For XML patterns, the key name is what we want to show
-                                                // Allow it even if it's a keyword (like "passwd", "usuario")
-                                                if captured.chars().any(|c| c.is_alphanumeric() || c == '_')
-                                                    && captured.len() < 100 {
-                                                    captured
-                                                } else {
-                                                    "unknown".to_string()
-                                                }
-                                            } else {
-                                                // For non-XML patterns, filter out keywords
-                                                let keywords = ["api", "key", "apikey", "password", "passwd", "pwd", "token", "secret"];
-                                                let captured_lower = captured.to_lowercase();
-                                                
-                                                if !keywords.contains(&captured_lower.as_str())
-                                                    && captured.chars().any(|c| c.is_alphanumeric() || c == '_')
-                                                    && captured.len() < 100
-                                                    && captured.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
-                                                    captured
-                                                } else {
-                                                    "unknown".to_string()
-                                                }
-                                            }
-                                        })
-                                        .unwrap_or_else(|| {
-                                            // Fallback: use regex to extract variable name from the line
-                                            // Use pre-compiled regex to extract variable name: match pattern like "variable_name = value" or "variable_name: value"
-                                            // This regex looks for: (optional keywords) variable_name (optional type) = or :
-                                            // Match: optional keywords (with word boundaries), then variable name (camelCase, snake_case, UPPER_CASE), then = or :
-                                            if let Some(var_captures) = VAR_NAME_REGEX_WITH_KEYWORDS.captures(line) {
-                                                if let Some(var_match) = var_captures.get(1) {
-                                                    let var_name = var_match.as_str().to_string();
-                                                    if var_name.len() < 100 && var_name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
-                                                        return var_name;
-                                                    }
-                                                }
-                                            }
-                                            
-                                            // Alternative: try to match variable name directly before = or : without keywords
-                                            // This regex finds ALL variable names before the assignment operator and takes the LAST one
-                                            // It handles cases like: private readonly publicApiKey = "value"
-                                            // Find all matches and take the last one (closest to the assignment)
-                                            let mut last_match: Option<String> = None;
-                                            for cap in VAR_NAME_REGEX_SIMPLE.captures_iter(line) {
-                                                if let Some(var_match) = cap.get(1) {
-                                                    let var_name = var_match.as_str().to_string();
-                                                    // Exclude common keywords
-                                                    let keywords = ["private", "public", "readonly", "const", "let", "var", "final", "static", "protected", "internal", "api", "key", "apikey"];
-                                                    if !keywords.contains(&var_name.to_lowercase().as_str())
-                                                        && var_name.len() < 100 
-                                                        && var_name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
-                                                        last_match = Some(var_name);
-                                                    }
-                                                }
-                                            }
-                                            
-                                            if let Some(name) = last_match {
-                                                return name;
-                                            }
-                                            
-                                            // If regex didn't work, try manual extraction
-                                            if match_start >= line_start {
-                                                let before_match = &line[..match_start - line_start];
-                                                
-                                                // Find the position of the assignment operator (= or :)
-                                                let assign_pos = before_match.rfind(|c| c == '=' || c == ':');
-                                                
-                                                if let Some(pos) = assign_pos {
-                                                    // Get the part before the assignment operator
-                                                    let var_part = &before_match[..pos].trim();
-                                                    
-                                                    // Common keywords to remove (only as whole words, case-insensitive)
-                                                    let keywords = ["private", "public", "readonly", "const", "let", "var", "final", "static", "protected", "internal"];
-                                                    
-                                                    // Split into words and filter out keywords
-                                                    let words: Vec<&str> = var_part.split_whitespace().collect();
-                                                    
-                                                    // Find the last word that is NOT a keyword (case-insensitive comparison)
-                                                    words.iter()
-                                                        .rev()
-                                                        .find(|word| {
-                                                            let cleaned = word.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';' || c == '{' || c == '[' || c == '(' || c == ')' || c == ']' || c == '}');
-                                                            let cleaned_lower = cleaned.to_lowercase();
-                                                            !keywords.iter().any(|kw| cleaned_lower == *kw)
-                                                                && cleaned.chars().any(|c| c.is_alphanumeric() || c == '_')
-                                                                && cleaned.len() < 100
-                                                                && cleaned.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
-                                                        })
-                                                        .map(|word| {
-                                                            word.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';' || c == '{' || c == '[' || c == '(' || c == ')' || c == ']' || c == '}')
-                                                                .to_string()
-                                                        })
-                                                        .unwrap_or_else(|| {
-                                                            // Fallback: take the last word
-                                                            words.last()
-                                                                .map(|w| w.trim_matches(|c| c == '"' || c == '\'' || c == '=' || c == ':' || c == ',' || c == ';' || c == '{' || c == '[' || c == '(' || c == ')' || c == ']' || c == '}').to_string())
-                                                                .unwrap_or_else(|| "unknown".to_string())
-                                                        })
-                                                } else {
-                                                    // No assignment operator, try last word
-                                                    let words: Vec<&str> = before_match.split_whitespace().collect();
-                                                    words.last()
-                                                        .map(|w| w.trim_matches(|c| c == '"' || c == '\'' || c == '=' || c == ':' || c == ',' || c == ';' || c == '{' || c == '[' || c == '(' || c == ')' || c == ']' || c == '}').to_string())
-                                                        .unwrap_or_else(|| "unknown".to_string())
-                                                }
-                                            } else {
-                                                "unknown".to_string()
-                                            }
-                                        });
-                                    
-                                    // Add this match to found_patterns (check for duplicates first)
-                                    let pattern_entry = (var_name.clone(), secret_type.to_string());
-                                    if !found_patterns.iter().any(|(v, s)| v == &pattern_entry.0 && s == &pattern_entry.1) {
-                                        found_patterns.push(pattern_entry);
-                                    }
-                            }
-                        }
-                        (Some((url_clean.clone(), found_patterns)), false, url_clean.clone())
-                    }
-                    Err(e) => {
-                        // Record error if it's an HTTP error
-                        if let super::github::GithubError::InvalidResponse(msg) = &e {
-                            if msg.contains("status") {
-                                // Try to extract status code from error message
-                                let status_code = msg
-                                    .split("status ")
-                                    .nth(1)
-                                    .and_then(|s| s.split_whitespace().next())
-                                    .and_then(|s| s.parse::<u16>().ok())
-                                    .unwrap_or(404);
-                                error_counter_clone.record_error(status_code);
-                            }
-                        }
-                        (None, false, url_clean.clone())
-                    }
+            if !keywords.contains(&captured_lower.as_str())
+                && captured.chars().any(|c| c.is_alphanumeric() || c == '_')
+                && captured.len() < 100
+                && captured.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
+                captured
+            } else {
+                "unknown".to_string()
+            }
+        }
+    })
+    .unwrap_or_else(|| {
+        // Fallback: use regex to extract variable name from the line
+        // Use pre-compiled regex to extract variable name: match pattern like "variable_name = value" or "variable_name: value"
+        // This regex looks for: (optional keywords) variable_name (optional type) = or :
+        // Match: optional keywords (with word boundaries), then variable name (camelCase, snake_case, UPPER_CASE), then = or :
+        if let Some(var_captures) = VAR_NAME_REGEX_WITH_KEYWORDS.captures(line) {
+            if let Some(var_match) = var_captures.get(1) {
+                let var_name = var_match.as_str().to_string();
+                if var_name.len() < 100 && var_name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
+                    return var_name;
                 }
             }
         }
-        ).collect();
         
-        let file_results = join_all(file_futures).await;
-        
-        for result in file_results {
-            match result {
-                (Some((url_clean, patterns)), false, _) => {
-                    for (var_name, secret_type) in patterns {
-                        secrets_found.push((url_clean.clone(), var_name, secret_type));
-                    }
+        // Alternative: try to match variable name directly before = or : without keywords
+        // This regex finds ALL variable names before the assignment operator and takes the LAST one
+        // It handles cases like: private readonly publicApiKey = "value"
+        // Find all matches and take the last one (closest to the assignment)
+        let mut last_match: Option<String> = None;
+        for cap in VAR_NAME_REGEX_SIMPLE.captures_iter(line) {
+            if let Some(var_match) = cap.get(1) {
+                let var_name = var_match.as_str().to_string();
+                // Exclude common keywords
+                let keywords = ["private", "public", "readonly", "const", "let", "var", "final", "static", "protected", "internal", "api", "key", "apikey"];
+                if !keywords.contains(&var_name.to_lowercase().as_str())
+                    && var_name.len() < 100 
+                    && var_name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
+                    last_match = Some(var_name);
                 }
-                (Some((url_clean, _)), true, _) => {
-                    skipped_files += 1;
-                    if let Some(ext) = url_clean.split('.').last() {
-                        skipped_files_extensions.push(ext.to_string());
-                    }
-                }
-                (None, true, url_clean) => {
-                    skipped_files += 1;
-                    if let Some(ext) = url_clean.split('.').last() {
-                        skipped_files_extensions.push(ext.to_string());
-                    }
-                }
-                _ => {}
             }
         }
         
-        // Update progress bar BEFORE processing (so user sees progress immediately)
-        // Skip repository if quiet mode and no secrets found (BEFORE printing anything)
-        if quiet && secrets_found.is_empty() {
-            index += 1;
-            continue;
+        if let Some(name) = last_match {
+            return name;
         }
         
-        // Now print repository info (only if we have secrets or quiet is false)
-        // Box header - use current index, then increment for next iteration
-        let current_index = index;
-        index += 1;
-        println!("{}", create_box_header("Repository", current_index, total_repos, BOX_WIDTH).cyan().bold());
-        
-        // Repository URL
-        println!("{}", create_box_row("🔗 URL", &repo_url, BOX_WIDTH - 2));
-        println!("{}", create_box_separator(BOX_WIDTH));
-        
-        // Get repository metadata to display branch (if API returns it)
-        use super::github::{extract_repo_info, get_repo_metadata, get_repo_languages};
-        if let Some((owner, repo_name)) = extract_repo_info(&repo_url) {
-            if let Ok(metadata) = get_repo_metadata(token, &owner, &repo_name).await {
-                let branch = metadata.default_branch.clone();
-                println!("{}", create_box_row("🌿 Branch", &branch, BOX_WIDTH - 2));
-                println!("{}", create_box_separator(BOX_WIDTH));
+        // If regex didn't work, try manual extraction
+        if match_start >= line_start {
+            let before_match = &line[..match_start - line_start];
+            
+            // Find the position of the assignment operator (= or :)
+            let assign_pos = before_match.rfind(|c| c == '=' || c == ':');
+            
+            if let Some(pos) = assign_pos {
+                // Get the part before the assignment operator
+                let var_part = &before_match[..pos].trim();
+                
+                // Common keywords to remove (only as whole words, case-insensitive)
+                let keywords = ["private", "public", "readonly", "const", "let", "var", "final", "static", "protected", "internal"];
+                
+                // Split into words and filter out keywords
+                let words: Vec<&str> = var_part.split_whitespace().collect();
+                
+                // Find the last word that is NOT a keyword (case-insensitive comparison)
+                words.iter()
+                    .rev()
+                    .find(|word| {
+                        let cleaned = word.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';' || c == '{' || c == '[' || c == '(' || c == ')' || c == ']' || c == '}');
+                        let cleaned_lower = cleaned.to_lowercase();
+                        !keywords.iter().any(|kw| cleaned_lower == *kw)
+                            && cleaned.chars().any(|c| c.is_alphanumeric() || c == '_')
+                            && cleaned.len() < 100
+                            && cleaned.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false)
+                    })
+                    .map(|word| {
+                        word.trim_matches(|c| c == '"' || c == '\'' || c == ',' || c == ';' || c == '{' || c == '[' || c == '(' || c == ')' || c == ']' || c == '}')
+                            .to_string()
+                    })
+                    .unwrap_or_else(|| {
+                        // Fallback: take the last word
+                        words.last()
+                            .map(|w| w.trim_matches(|c| c == '"' || c == '\'' || c == '=' || c == ':' || c == ',' || c == ';' || c == '{' || c == '[' || c == '(' || c == ')' || c == ']' || c == '}').to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    })
+            } else {
+                // No assignment operator, try last word
+                let words: Vec<&str> = before_match.split_whitespace().collect();
+                words.last()
+                    .map(|w| w.trim_matches(|c| c == '"' || c == '\'' || c == '=' || c == ':' || c == ',' || c == ';' || c == '{' || c == '[' || c == '(' || c == ')' || c == ']' || c == '}').to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
             }
+        } else {
+            "unknown".to_string()
         }
-        if let Some((owner, repo_name)) = extract_repo_info(&repo_url) {
-        let languages = match get_repo_languages(token, &owner, &repo_name).await {
-            Ok(languages) => {
-                let langs: HashMap<String, u64> =
-                serde_json::from_str(&languages).expect("Failed to parse languages JSON");
-                let total: u64 = langs.values().sum();
-                let mut parts = Vec::new();
-                let mut other_langs = 0;
-                for (lang, bytes) in &langs {
-                    let pct = (*bytes as f64 / total as f64) * 100.0;
-                    if pct > 1.0 {
-                        parts.push(format!(
-                            "• {}: {}",
-                            lang.bold().cyan(),
-                            format!("{pct:.2}%").yellow()
-                        ));
-                    }
-                    else {
-                        other_langs += *bytes;
-                    }
-                }
-                if other_langs > 0 {
-                    let other_pct = (other_langs as f64 / total as f64) * 100.0;
-                    parts.push(format!(
-                        "{}: {}",
-                        "Other".bold().cyan(),
-                        format!("{other_pct:.2}%").yellow()
-                    ));
-                }
-                println!("{}", create_box_row("🌐 Languages", &parts.join("\n"), BOX_WIDTH - 2));
-                println!("{}", create_box_separator(BOX_WIDTH));
-            }
-            Err(e) => {
-                println!("{}", create_box_row("❌ Error", &format!("Failed to get repository languages: {}", e), BOX_WIDTH - 2));
-                println!("{}\n", create_box_footer(BOX_WIDTH));
-                continue;
-            }
-            };
-        }
+    })
 
-        
-        // Files detected - show full paths
-        let files_list: Vec<String> = repo.files_urls.iter()
-            .map(|x| extract_file_path(x))
-            .collect();
-        let files_str = if files_list.is_empty() {
-            "None".to_string()
-        } else {
-            files_list.join(", ")
-        };
-        println!("{}", create_box_row("📝 Files", &files_str, BOX_WIDTH - 2));
-        println!("{}", create_box_separator(BOX_WIDTH));
-        
-        // Secrets found
-        if !secrets_found.is_empty() {
-            println!("{}", create_box_row("🚨 Secrets Found", &format!("{} potential secret(s)", secrets_found.len()), BOX_WIDTH - 2));
-            for (file_url, var_name, secret_type) in &secrets_found {
-                let file_path = extract_file_path(file_url);
-                let display_info = if var_name != "unknown" {
-                    format!("{}: {}", var_name.bold().cyan(), secret_type)
-                } else {
-                    secret_type.to_string()
-                };
-                println!("│   {} {} {}", "⚠️".red(), file_path.bold().yellow(), format!("({})", display_info).dimmed());
-            }
-            println!("{}", create_box_separator(BOX_WIDTH));
-        } else {
-            println!("{}", create_box_row("✅ Status", "No secrets detected", BOX_WIDTH - 2));
-            println!("{}", create_box_separator(BOX_WIDTH));
-        }
-        
-        // Last commit dates (file and repo)
-        let file_date = repo.last_commit_date_file.format("%d/%m/%Y %H:%M:%S UTC").to_string();
-        let repo_date = repo.last_commit_date.format("%d/%m/%Y %H:%M:%S UTC").to_string();
-        println!("{}", create_box_row("📆 Last commit (file)", &file_date, BOX_WIDTH - 2));
-        println!("{}", create_box_row("📆 Last commit (repo)", &repo_date, BOX_WIDTH - 2));
-        
-        // Skipped files info
-        if skipped_files > 0 {
-            println!("{}", create_box_separator(BOX_WIDTH));
-            let skipped_info = format!("{} file(s) skipped ({})", skipped_files, skipped_files_extensions.join(", "));
-            println!("{}", create_box_row("⏭️  Skipped", &skipped_info, BOX_WIDTH - 2));
-        }
-        
-        // Box footer
-        println!("{}\n", create_box_footer(BOX_WIDTH));
-    }
-    
-    println!("{}", "═".repeat(BOX_WIDTH).cyan());
-    println!("{}", "  ✨ Analysis Complete".bold().green());
-    println!("{}\n", "═".repeat(BOX_WIDTH).cyan());
-    
-    // Print error summary
-    error_counter.print_summary();
 }
 
-pub async fn whole_repo_detection(result: HashMap<String, Repository>, token: &str, _domain: &str, error_counter: super::github::HttpErrorCounter, sort_order: &str, commit_date_kind: &str, max_files: Option<usize>, quiet: bool) {
-    const BOX_WIDTH: usize = 80;
-    
-    // Convert HashMap to Vec and sort by selected commit date (file or repo)
-    let mut repos: Vec<(String, Repository)> = result.into_iter().collect();
-    let kind = if commit_date_kind == "repo" { "repo" } else { "file" };
-    match sort_order {
-        "asc" => repos.sort_by(|a, b| repo_sort_date(&a.1, commit_date_kind).cmp(&repo_sort_date(&b.1, commit_date_kind))),
-        "desc" => repos.sort_by(|a, b| repo_sort_date(&b.1, commit_date_kind).cmp(&repo_sort_date(&a.1, commit_date_kind))),
+/// Scan one file's content. Every match is reported (not just one per pattern) with its line number.
+/// `url` is the GitHub link of the file; findings get `url#L<line>`.
+pub fn scan_content(file: &str, url: &str, content: &str, reveal: bool) -> ScanOutput {
+    let mut out = ScanOutput::default();
+    for (pattern, secret_type) in PATTERNS.iter() {
+        for captures in pattern.captures_iter(content) {
+            let m = captures.get(0).unwrap();
+            let match_start = m.start();
+            let line_start = content[..match_start].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = content[match_start..].find('\n').map_or(content.len(), |i| match_start + i);
+            let line = &content[line_start..line_end];
+            let line_no = content.as_bytes()[..match_start].iter().filter(|&&b| b == b'\n').count() + 1;
+
+            let reads_env = line.contains("os.environ")
+                || line.contains("process.env")
+                || line.contains("getenv()")
+                || line.contains("os.getenv")
+                || ENV_PLACEHOLDER_REGEX.is_match(line);
+            if reads_env {
+                if !out.env_references.iter().any(|r| r.line == line_no) {
+                    out.env_references.push(EnvReference { file: file.to_string(), line: line_no, text: line.trim().to_string() });
+                }
+                continue;
+            }
+
+            // Never exclude lines that look like XML config (<add key="..." value="...">)
+            let looks_like_xml_config = line.contains("<add") && line.contains("key=") && line.contains("value=");
+            if !looks_like_xml_config && EXCLUSION_PATTERNS.iter().any(|exclusion| exclusion.is_match(line)) {
+                continue;
+            }
+            if out.findings.iter().any(|f| f.line == line_no && f.secret_type == *secret_type) {
+                continue;
+            }
+
+            let variable = extract_var_name(&captures, secret_type, line, line_start, match_start);
+            // The secret is the last capture group that participated, or the whole match.
+            let value = (1..captures.len()).rev().find_map(|i| captures.get(i)).unwrap_or(m).as_str();
+            out.findings.push(Finding {
+                file: file.to_string(),
+                line: line_no,
+                variable,
+                secret_type: secret_type.to_string(),
+                severity: Severity::of(secret_type),
+                value: if reveal { value.to_string() } else { mask(value) },
+                url: format!("{}#L{}", url, line_no),
+            });
+        }
+    }
+    out
+}
+
+/// Everything known about one scanned repository. Printed as a box, or serialized with `--json`.
+#[derive(Default, Serialize)]
+pub struct RepoReport {
+    pub repository: String,
+    /// "scanned", "skipped" or "error"
+    pub status: &'static str,
+    pub note: Option<String>,
+    pub branch: Option<String>,
+    pub description: Option<String>,
+    pub topics: Vec<String>,
+    pub languages: Vec<(String, f64)>,
+    pub matched_files: Vec<String>,
+    pub files_scanned: usize,
+    pub skipped_files: usize,
+    pub skipped_extensions: Vec<String>,
+    pub last_commit_file: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_commit_repo: Option<chrono::DateTime<chrono::Utc>>,
+    pub findings: Vec<Finding>,
+    pub env_references: Vec<EnvReference>,
+}
+
+impl RepoReport {
+    fn new(repo: &Repository) -> Self {
+        RepoReport {
+            repository: repo.repository_url.clone(),
+            status: "scanned",
+            last_commit_file: Some(repo.last_commit_date_file),
+            last_commit_repo: Some(repo.last_commit_date),
+            ..Default::default()
+        }
+    }
+
+    fn fail(mut self, status: &'static str, note: impl Into<String>) -> Self {
+        self.status = status;
+        self.note = Some(note.into());
+        self
+    }
+
+    /// Highest severity first, then by file and line.
+    fn sort_findings(&mut self) {
+        self.findings.sort_by(|a, b| b.severity.cmp(&a.severity).then_with(|| (&a.file, a.line).cmp(&(&b.file, b.line))));
+    }
+
+    fn merge(&mut self, path: &str, outcome: FileOutcome) {
+        match outcome {
+            FileOutcome::Skipped => {
+                self.skipped_files += 1;
+                if let Some(ext) = path.rsplit('.').next() {
+                    if !self.skipped_extensions.iter().any(|e| e == ext) {
+                        self.skipped_extensions.push(ext.to_string());
+                    }
+                }
+            }
+            FileOutcome::Failed => {}
+            FileOutcome::Scanned(out) => {
+                self.files_scanned += 1;
+                self.findings.extend(out.findings);
+                self.env_references.extend(out.env_references);
+            }
+        }
+    }
+}
+
+fn language_shares(langs: HashMap<String, u64>) -> Vec<(String, f64)> {
+    let total: u64 = langs.values().sum();
+    let mut shares: Vec<(String, f64)> = langs.into_iter()
+        .map(|(l, b)| (l, b as f64 / total.max(1) as f64 * 100.0))
+        .collect();
+    shares.sort_by(|a, b| b.1.total_cmp(&a.1));
+    shares
+}
+
+enum FileOutcome {
+    Skipped,
+    Failed,
+    Scanned(ScanOutput),
+}
+
+/// Fetch (via `fetch`) and scan one file, bounded by `semaphore`. The regex work runs off the async runtime.
+async fn process_file<F>(
+    path: String,
+    url: String,
+    reveal: bool,
+    semaphore: &tokio::sync::Semaphore,
+    counter: &super::github::HttpErrorCounter,
+    pb: Option<&indicatif::ProgressBar>,
+    fetch: F,
+) -> (String, FileOutcome)
+where
+    F: std::future::Future<Output = Result<String, super::github::GithubError>>,
+{
+    let outcome = if FILES_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
+        FileOutcome::Skipped
+    } else {
+        let _permit = semaphore.acquire().await.unwrap();
+        match fetch.await {
+            Ok(content) => {
+                let p = path.clone();
+                match tokio::task::spawn_blocking(move || scan_content(&p, &url, &content, reveal)).await {
+                    Ok(out) => FileOutcome::Scanned(out),
+                    Err(_) => FileOutcome::Failed,
+                }
+            }
+            Err(e) => {
+                counter.record_github_error_opt(Some(&e));
+                FileOutcome::Failed
+            }
+        }
+    };
+    if let Some(pb) = pb {
+        pb.inc(1);
+    }
+    (path, outcome)
+}
+
+/// Single-file mode: analyze only the files that matched the search.
+async fn scan_single(repo: &Repository, token: &str, counter: &super::github::HttpErrorCounter, reveal: bool) -> RepoReport {
+    use super::github::{extract_repo_info, get_repo_metadata, get_repo_languages, get_raw_file_content_from_api};
+    const MAX_CONCURRENT_FILE_REQUESTS: usize = 30;
+
+    let mut report = RepoReport::new(repo);
+    report.matched_files = repo.files_urls.iter().map(|x| extract_file_path(x)).collect();
+
+    let semaphore = tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_REQUESTS);
+    let files = futures::future::join_all(repo.files_urls.iter().zip(&repo.files_urls_api).map(|(html, api)| {
+        process_file(extract_file_path(html), clean_url(html), reveal, &semaphore, counter, None,
+            get_raw_file_content_from_api(api.clone(), token))
+    }));
+    // Metadata and languages are decoration: a failure there must never hide findings.
+    let meta = async {
+        let (owner, name) = extract_repo_info(&repo.repository_url)?;
+        let (m, l) = tokio::join!(get_repo_metadata(token, &owner, &name), get_repo_languages(token, &owner, &name));
+        counter.record_github_error_opt(m.as_ref().err());
+        counter.record_github_error_opt(l.as_ref().err());
+        Some((m.ok(), l.ok()))
+    };
+    let (files, meta) = tokio::join!(files, meta);
+
+    if let Some((m, l)) = meta {
+        report.branch = m.map(|m| m.default_branch);
+        report.languages = l.map(language_shares).unwrap_or_default();
+    }
+    for (path, outcome) in files {
+        report.merge(&path, outcome);
+    }
+    report.sort_findings();
+    report
+}
+
+/// Whole-repo mode: fetch the file tree and scan the config-like files.
+async fn scan_whole(repo: &Repository, token: &str, domain: &str, counter: &super::github::HttpErrorCounter, max_files: Option<usize>, reveal: bool) -> RepoReport {
+    use super::github::{extract_repo_info, get_repo_metadata, should_scan_repository, get_repo_files_recursive, get_file_content_by_sha};
+    use indicatif::{ProgressBar, ProgressStyle};
+    const MAX_CONCURRENT_FILE_REQUESTS: usize = 40;
+
+    let report = RepoReport::new(repo);
+    let Some((owner, name)) = extract_repo_info(&repo.repository_url) else {
+        return report.fail("error", "Failed to parse repository URL");
+    };
+    let metadata = match get_repo_metadata(token, &owner, &name).await {
+        Ok(m) => m,
+        Err(e) => {
+            counter.record_github_error_opt(Some(&e));
+            return report.fail("error", format!("Failed to get repository metadata: {}", e));
+        }
+    };
+    let (should_scan, reason) = should_scan_repository(&metadata, domain);
+    if !should_scan {
+        return report.fail("skipped", reason.unwrap_or_else(|| "Repository filtered out".to_string()));
+    }
+    let mut report = report;
+    report.branch = Some(metadata.default_branch.clone());
+    report.description = metadata.description.filter(|d| !d.is_empty());
+    report.topics = metadata.topics;
+
+    let all_files = match get_repo_files_recursive(token, &owner, &name, &metadata.default_branch).await {
+        Ok(files) => files,
+        Err(e) => {
+            counter.record_github_error_opt(Some(&e));
+            return report.fail("error", format!("Failed to get repository files: {}", e));
+        }
+    };
+    let mut files: Vec<(String, String)> = all_files.into_iter().filter(|(p, _)| is_interesting_config_file(p)).collect();
+    let total_interesting = files.len();
+    if let Some(limit) = max_files {
+        files.truncate(limit);
+    }
+    if files.len() > MAX_FILES_PER_REPO {
+        return report.fail("skipped", format!("{} interesting files (limit {}); use --max-files", total_interesting, MAX_FILES_PER_REPO));
+    }
+    if files.len() < total_interesting {
+        report.note = Some(format!("--max-files applied: {} of {} interesting files scanned", files.len(), total_interesting));
+    }
+
+    let pb = ProgressBar::new(files.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.magenta} [{elapsed_precise}] [{bar:20.magenta/blue}] {pos:>5}/{len:5} ({percent:>3}%) {msg:.dim}")
+        .unwrap()
+        .progress_chars("█▉▊▋▌▍▎▏░"));
+    pb.set_message(format!("Scanning {}/{}", owner, name));
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let semaphore = tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_REQUESTS);
+    let results = futures::future::join_all(files.iter().map(|(path, sha)| {
+        let url = format!("https://github.com/{}/{}/blob/{}/{}", owner, name, metadata.default_branch, path);
+        process_file(path.clone(), url, reveal, &semaphore, counter, Some(&pb), get_file_content_by_sha(token, &owner, &name, sha))
+    })).await;
+    pb.finish_and_clear();
+
+    for (path, outcome) in results {
+        report.merge(&path, outcome);
+    }
+    report.sort_findings();
+    report
+}
+
+const BOX_WIDTH: usize = 80;
+
+fn print_report(r: &RepoReport, index: usize, total: usize) {
+    let row = |label: &str, value: &str| println!("{}", create_box_row(label, value, BOX_WIDTH - 2));
+    let sep = || println!("{}", create_box_separator(BOX_WIDTH));
+
+    println!("{}", create_box_header("Repository", index, total, BOX_WIDTH).cyan().bold());
+    row("🔗 URL", &r.repository);
+    sep();
+
+    match (r.status, &r.note) {
+        ("skipped", note) => row("⏭️  Skipped", note.as_deref().unwrap_or("")),
+        ("error", note) => row("❌ Error", note.as_deref().unwrap_or("")),
         _ => {}
     }
-    
-    let total_repos = repos.len();
-    let mut index = 1;
-    
-    println!("\n{}", "═".repeat(BOX_WIDTH).cyan());
-    println!("{}", format!("  🔍 Whole Repository Analysis - Found {} Repository(ies)", total_repos).bold().cyan());
-    println!("{}", "  🔐 Scanning likely config/secret files (not filtered by domain)".bold().cyan());
-    println!("{}", format!("  📊 Sorted by {} commit date: {} ({} first)", 
-        kind,
-        if sort_order == "asc" { "Ascending" } else { "Descending" },
-        if sort_order == "asc" { "oldest" } else { "newest" }
-    ).bold().cyan());
-    if let Some(n) = max_files {
-        println!("{}", format!("  📁 Max files per repo: {} (--max-files)", n).bold().cyan());
-    }
-    println!("{}\n", "═".repeat(BOX_WIDTH).cyan());
-    
-    use super::github::{extract_repo_info, get_repo_files_recursive, get_file_content_by_sha};
-    use indicatif::{ProgressBar, ProgressStyle};
-    
-    for (repo_url, repo) in repos {
-        let mut secrets_found: Vec<(String, String)> = Vec::new(); // (path, pattern)
-        let mut files_analyzed = 0;
-        let mut skipped_files = 0;
-        let mut skipped_extensions: Vec<String> = Vec::new();
-        let mut hidden_secrets: Vec<(String, String)> = Vec::new(); // (file_path, match_line)
-        let mut skip_entire_file_due_to_hidden = false;
-        
-        // Add a newline to separate from progress bar
-        println!();
-        
-
-
-        // Box header - use current index, then increment for next iteration
-        let current_index = index;
-        index += 1;
-        println!("{}", create_box_header("Repository", current_index, total_repos, BOX_WIDTH).cyan().bold());
-        println!("{}", create_box_row("🔗 URL", &repo_url, BOX_WIDTH - 2));
-        println!("{}", create_box_separator(BOX_WIDTH));
-        
-        // Extract owner and repo name
-        let (owner, repo_name) = match extract_repo_info(&repo_url) {
-            Some(info) => info,
-            None => {
-                println!("{}", create_box_row("❌ Error", "Failed to parse repository URL", BOX_WIDTH - 2));
-                println!("{}\n", create_box_footer(BOX_WIDTH));
-                continue;
-            }
-        };
-        
-        println!("{}", create_box_row("📦 Repository", &format!("{}/{}", owner, repo_name), BOX_WIDTH - 2));
-        println!("{}", create_box_separator(BOX_WIDTH));
-        
-        // Get repository metadata and check if it should be scanned
-        use super::github::{get_repo_metadata, should_scan_repository};
-        let metadata = match get_repo_metadata(token, &owner, &repo_name).await {
-            Ok(m) => m,
-            Err(e) => {
-                println!("{}", create_box_row("❌ Error", &format!("Failed to get repository metadata: {}", e), BOX_WIDTH - 2));
-                println!("{}\n", create_box_footer(BOX_WIDTH));
-                continue;
-            }
-        };
-        
-        // Check if repository should be scanned
-        let (should_scan, skip_reason) = should_scan_repository(&metadata, _domain);
-        if !should_scan {
-            let reason = skip_reason.unwrap_or_else(|| "Repository filtered out".to_string());
-            println!("{}", create_box_row("⏭️  Skipped", &reason, BOX_WIDTH - 2));
-            println!("{}", create_box_separator(BOX_WIDTH));
-            println!("{}", create_box_row("💡 Reason", "This repository appears to be documentation, reports, analysis, or owned by the same company as the domain", BOX_WIDTH - 2));
-            println!("{}\n", create_box_footer(BOX_WIDTH));
-            continue;
-        }
-        
-        let branch = metadata.default_branch.clone();
-        println!("{}", create_box_row("🌿 Branch", &branch, BOX_WIDTH - 2));
-        if let Some(ref desc) = metadata.description {
-            if !desc.is_empty() {
-                println!("{}", create_box_row("📝 Description", desc, BOX_WIDTH - 2));
-            }
-        }
-        if !metadata.topics.is_empty() {
-            println!("{}", create_box_row("🏷️  Topics", &metadata.topics.join(", "), BOX_WIDTH - 2));
-        }
-        println!("{}", create_box_separator(BOX_WIDTH));
-        // Last commit dates (file that matched search, and repo)
-        let file_date = repo.last_commit_date_file.format("%d/%m/%Y %H:%M:%S UTC").to_string();
-        let repo_date = repo.last_commit_date.format("%d/%m/%Y %H:%M:%S UTC").to_string();
-        println!("{}", create_box_row("📆 Last commit (file)", &file_date, BOX_WIDTH - 2));
-        println!("{}", create_box_row("📆 Last commit (repo)", &repo_date, BOX_WIDTH - 2));
-        println!("{}", create_box_separator(BOX_WIDTH));
-        
-        // Get all files in repository
-        println!("{}", create_box_row("⏳ Status", "Scanning likely config/secret files for secrets...", BOX_WIDTH - 2));
-        
-        let all_files = match get_repo_files_recursive(token, &owner, &repo_name, &branch).await {
-            Ok(files) => files,
-            Err(e) => {
-                println!("{}", create_box_row("❌ Error", &format!("Failed to get repository files: {}", e), BOX_WIDTH - 2));
-                println!("{}\n", create_box_footer(BOX_WIDTH));
-                continue;
-            }
-        };
-        
-        // Filter to interesting config/secret-like files to reduce API calls
-        let mut interesting_files: Vec<(String, String)> = all_files
-            .into_iter()
-            .filter(|(path, _)| is_interesting_config_file(path))
-            .collect();
-
-        let total_interesting = interesting_files.len();
-
-        // Apply per-repo file limit if set (--max-files)
-        if let Some(limit) = max_files {
-            if interesting_files.len() > limit {
-                interesting_files.truncate(limit);
-            }
-        }
-
-        // Check if repository has too many files to analyze (even after filtering)
-        if interesting_files.len() > MAX_FILES_PER_REPO {
-            println!("{}", create_box_row("⚠️  Warning", &format!("Repository has {} interesting files (limit: {}). Skipping analysis to avoid API limits.", total_interesting, MAX_FILES_PER_REPO), BOX_WIDTH - 2));
-            println!("{}", create_box_separator(BOX_WIDTH));
-            println!("{}", create_box_row("💡 Tip", "This repository is too large for full analysis. Consider using single-file mode or --max-files.", BOX_WIDTH - 2));
-            println!("{}\n", create_box_footer(BOX_WIDTH));
-            continue;
-        }
-
-        let files_msg = if max_files.is_some() && total_interesting > interesting_files.len() {
-            format!("{} file(s) to analyze ({} interesting, limit applied)", interesting_files.len(), total_interesting)
-        } else {
-            format!("{} file(s) total", interesting_files.len())
-        };
-        println!("{}", create_box_row("📊 Total Files", &files_msg, BOX_WIDTH - 2));
-        println!("{}", create_box_separator(BOX_WIDTH));
-        
-        // Progress bar for file scanning with custom style
-        // Limit bar width to fit within 80 char box width
-        let pb = ProgressBar::new(interesting_files.len() as u64);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.magenta} [{elapsed_precise}] [{bar:20.magenta/blue}] {pos:>5}/{len:5} ({percent:>3}%) {msg:.dim}")
-            .unwrap()
-            .progress_chars("█▉▊▋▌▍▎▏░"));
-        pb.set_message("Scanning files...");
-        pb.enable_steady_tick(std::time::Duration::from_millis(100));
-        
-        // Analyze ALL files for secrets in parallel (no domain filtering)
-        use std::sync::Arc;
-        use tokio::sync::Semaphore;
-        use futures::future::join_all;
-        use std::sync::Mutex;
-        
-        const MAX_CONCURRENT_FILE_REQUESTS: usize = 40; // Increased for whole repo analysis
-        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_FILE_REQUESTS));
-        let error_counter_arc = Arc::new(error_counter.clone());
-        let token_arc = Arc::new(token.to_string());
-        let owner_arc = Arc::new(owner.clone());
-        let repo_name_arc = Arc::new(repo_name.clone());
-        
-        // Wrap progress bar in Arc<Mutex> to share between futures
-        let pb_arc = Arc::new(Mutex::new(pb));
-        
-        let file_futures: Vec<_> = interesting_files.iter().map(|(file_path, file_sha)| {
-            let file_path_clone = file_path.clone();
-            let file_sha_clone = file_sha.clone();
-            let semaphore_clone = semaphore.clone();
-            let error_counter_clone = error_counter_arc.clone();
-            let token_clone = token_arc.clone();
-            let owner_clone = owner_arc.clone();
-            let repo_name_clone = repo_name_arc.clone();
-            let pb_clone = pb_arc.clone();
-            let hidden_secrets_clone = hidden_secrets.clone();
-
-            async move {
-                // Skip certain file extensions
-                if FILES_EXTENSIONS.iter().any(|ext| file_path_clone.ends_with(ext)) {
-                    // Update progress bar for skipped files too
-                    if let Ok(pb_guard) = pb_clone.lock() {
-                        pb_guard.inc(1);
-                    }
-                    return (None, true, file_path_clone, Vec::new()); // (secrets, skipped, path)
-                }
-                
-                let _permit = semaphore_clone.acquire().await.unwrap();
-                let result = match get_file_content_by_sha(&token_clone, &owner_clone, &repo_name_clone, &file_sha_clone).await {
-                        Ok(content) => {
-                        let mut found_patterns = Vec::new();
-                        let mut hidden_matches: Vec<(String, String)> = Vec::new(); // (file_path, match_line)
-                        // Check for secrets - apply exclusion per-match-line, not per-file
-                        for (pattern, secret_type) in PATTERNS.iter() {
-                            for m in pattern.find_iter(&content) {
-                                let line_start = content[..m.start()].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                                let line_end = content[m.start()..].find('\n').map(|i| m.start() + i).unwrap_or(content.len());
-                                let match_line = &content[line_start..line_end];
-                                let looks_like_xml_config = match_line.contains("<add")
-                                    && match_line.contains("key=")
-                                    && match_line.contains("value=");
-
-                                static ENV_PLACEHOLDER_REGEX: Lazy<Regex> = Lazy::new(|| {
-                                    Regex::new(r"\$\{\w+\}").unwrap()
-                                    });
-                                let has_hidden_secrets = match_line.contains("os.environ")
-                                    || match_line.contains("process.env")
-                                    || match_line.contains("getenv()")
-                                    //|| !match_line.contains(">> .env")
-                                    || match_line.contains("os.getenv")
-                                    || ENV_PLACEHOLDER_REGEX.is_match(match_line);
-
-                                if has_hidden_secrets {
-                                    hidden_matches.push((file_path_clone.clone(), match_line.trim().to_string()));
-                                    skip_entire_file_due_to_hidden = true;
-                                }
-                                let is_excluded = !looks_like_xml_config
-                                    && EXCLUSION_PATTERNS.iter().any(|exclusion| {
-                                        exclusion.is_match(match_line)
-                                    });
-                                if !is_excluded {
-                                    found_patterns.push(secret_type.to_string());
-                                    break; // One match per pattern per file is enough
-                                }
-                            }
-                        }
-                        if skip_entire_file_due_to_hidden {
-                            return (None, true, file_path_clone, hidden_matches);
-                        }
-                        (Some(found_patterns), false, file_path_clone, hidden_matches)
-                    }
-                    Err(e) => {
-                        // Record error if it's an HTTP error
-                        if let super::github::GithubError::InvalidResponse(msg) = &e {
-                            if msg.contains("status") {
-                                // Try to extract status code from error message
-                                let status_code = msg
-                                    .split("status ")
-                                    .nth(1)
-                                    .and_then(|s| s.split_whitespace().next())
-                                    .and_then(|s| s.parse::<u16>().ok())
-                                    .unwrap_or(404);
-                                error_counter_clone.record_error(status_code);
-                            }
-                        }
-                        (None, false, file_path_clone, Vec::new())
-                    }
-                };
-                
-                // Update progress bar when this file completes
-                if let Ok(pb_guard) = pb_clone.lock() {
-                    pb_guard.inc(1);
-                }
-                
-                result
-            }
-        }).collect();
-        
-        // Wait for all files to process (progress bar updates as each completes)
-        let file_results = join_all(file_futures).await;
-        
-        // Get the progress bar back to finish it
-        let pb = Arc::try_unwrap(pb_arc).unwrap().into_inner().unwrap();
-        
-        // Process results
-        for result in file_results {
-            match result {
-                (Some(patterns), false, file_path, hidden_matches) => {
-                    files_analyzed += 1;
-                    for pattern in patterns {
-                        secrets_found.push((file_path.clone(), pattern));
-                    }
-                    for hidden_match in hidden_matches {
-                        hidden_secrets.push(hidden_match);
-                    }
-                }
-                (_, true, file_path, hidden_matches) => {
-                    skipped_files += 1;
-                    if let Some(ext) = file_path.split('.').last() {
-                        if !skipped_extensions.contains(&ext.to_string()) {
-                            skipped_extensions.push(ext.to_string());
-                        }
-                    }
-                    for hidden_match in hidden_matches {
-                        hidden_secrets.push(hidden_match);
-                    }
-                }
-                _ => {
-                skipped_files += 1;
-                }
-            }
-        }
-        
-        if quiet && secrets_found.is_empty() {
-            index += 1;
-            continue;
-        }
-        // Finish and clear the progress bar to avoid leftover output
-        pb.finish_and_clear();
-        
-        // Display results
-        println!("{}", create_box_row("📝 Files Analyzed", &format!("{} file(s) scanned for secrets", files_analyzed), BOX_WIDTH - 2));
-        println!("{}", create_box_separator(BOX_WIDTH));
-        
-        // Hidden secrets found
-        if !hidden_secrets.is_empty() {
-            println!("{}", create_box_separator(BOX_WIDTH));
-            println!(
-                "{}",
-                create_box_row(
-                    "🚨 Hidden/Env-based",
-                    &format!("{} match(es) skipped (env-based)", hidden_secrets.len()),
-                    BOX_WIDTH - 2
-                )
-            );
-            for (file_path, line_info) in &hidden_secrets {
-                println!(
-                    "│   {} {} {}",
-                    "ℹ️".yellow(),
-                    file_path.bold().yellow(),
-                    format!("({})", line_info).dimmed()
-                );
-            }
-            println!("{}", create_box_separator(BOX_WIDTH));
-        }
-
-        // Secrets found
-        if !secrets_found.is_empty() {
-            println!("{}", create_box_row("🚨 Secrets Found", &format!("{} potential secret(s) detected", secrets_found.len()), BOX_WIDTH - 2));
-            for (file_path, pattern) in &secrets_found {
-                println!("│   {} {} {}", "⚠️".red(), file_path.bold().yellow(), format!("({})", pattern).dimmed());
-            }
-            println!("{}", create_box_separator(BOX_WIDTH));
-        } else {
-            println!("{}", create_box_row("✅ Secrets Status", "No secrets detected in repository", BOX_WIDTH - 2));
-            println!("{}", create_box_separator(BOX_WIDTH));
-        }
-        
-        // Skipped files info
-        if skipped_files > 0 {
-            println!("{}", create_box_separator(BOX_WIDTH));
-            let skipped_info = format!("{} file(s) skipped ({})", skipped_files, skipped_extensions.join(", "));
-            println!("{}", create_box_row("⏭️  Skipped", &skipped_info, BOX_WIDTH - 2));
-        }
-        
-        // Box footer
+    if r.status != "scanned" {
         println!("{}\n", create_box_footer(BOX_WIDTH));
+        return;
     }
-    
-    println!("{}", "═".repeat(BOX_WIDTH).cyan());
-    println!("{}", "  ✨ Whole Repository Analysis Complete".bold().green());
-    println!("{}\n", "═".repeat(BOX_WIDTH).cyan());
-    
-    // Print error summary
-    error_counter.print_summary();
+
+    if let Some(b) = &r.branch { row("🌿 Branch", b); }
+    if let Some(d) = &r.description { row("📝 Description", d); }
+    if !r.topics.is_empty() { row("🏷️  Topics", &r.topics.join(", ")); }
+    if !r.languages.is_empty() {
+        let (shown, other): (Vec<_>, Vec<_>) = r.languages.iter().partition(|(_, p)| *p > 1.0);
+        let mut parts: Vec<String> = shown.iter().map(|(l, p)| format!("• {}: {}", l.bold().cyan(), format!("{p:.2}%").yellow())).collect();
+        if !other.is_empty() {
+            parts.push(format!("{}: {}", "Other".bold().cyan(), format!("{:.2}%", other.iter().map(|(_, p)| p).sum::<f64>()).yellow()));
+        }
+        row("🌐 Languages", &parts.join("\n"));
+    }
+    sep();
+    if !r.matched_files.is_empty() { row("📝 Files", &r.matched_files.join(", ")); }
+    row("📊 Scanned", &format!("{} file(s)", r.files_scanned));
+    if let Some(note) = &r.note { row("ℹ️  Note", note); }
+    if let (Some(f), Some(c)) = (r.last_commit_file, r.last_commit_repo) {
+        row("📆 Last commit (file)", &f.format("%d/%m/%Y %H:%M:%S UTC").to_string());
+        row("📆 Last commit (repo)", &c.format("%d/%m/%Y %H:%M:%S UTC").to_string());
+    }
+    sep();
+
+    if !r.env_references.is_empty() {
+        row("ℹ️  Env-based", &format!("{} match(es) read from the environment (not reported)", r.env_references.len()));
+        for e in &r.env_references {
+            println!("│   {} {}:{} {}", "ℹ️".yellow(), e.file.bold().yellow(), e.line, format!("({})", e.text).dimmed());
+        }
+        sep();
+    }
+    if r.findings.is_empty() {
+        row("✅ Status", "No secrets detected");
+    } else {
+        row("🚨 Secrets Found", &format!("{} potential secret(s)", r.findings.len()));
+        for f in &r.findings {
+            let what = if f.variable != "unknown" { format!("{}: {}", f.variable.bold().cyan(), f.secret_type) } else { f.secret_type.clone() };
+            println!("│   [{}] {}:{} ({}) {}", f.severity.label(), f.file.bold().yellow(), f.line, what, f.value.dimmed());
+        }
+    }
+    if r.skipped_files > 0 {
+        sep();
+        row("⏭️  Skipped", &format!("{} file(s) skipped ({})", r.skipped_files, r.skipped_extensions.join(", ")));
+    }
+    println!("{}\n", create_box_footer(BOX_WIDTH));
 }
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ScanMode {
+    SingleFile,
+    WholeRepo,
+}
+
+pub struct ScanOptions {
+    pub mode: ScanMode,
+    pub domain: String,
+    pub sort_order: String,
+    pub commit_date_kind: String,
+    pub max_files: Option<usize>,
+    pub quiet: bool,
+    pub show_secrets: bool,
+    /// `Some(None)` = JSON to stdout, `Some(Some(path))` = JSON to file.
+    pub json: Option<Option<std::path::PathBuf>>,
+}
+
+/// Scan every repository and report. Boxes (or JSON) go to stdout, headers and summaries to stderr.
+/// Returns the total number of findings.
+pub async fn run_scan(result: HashMap<String, Repository>, token: &str, error_counter: super::github::HttpErrorCounter, opts: ScanOptions) -> usize {
+    let mut repos: Vec<Repository> = result.into_values().collect();
+    let key = |r: &Repository| repo_sort_date(r, &opts.commit_date_kind);
+    match opts.sort_order.as_str() {
+        "asc" => repos.sort_by_key(|r| key(r)),
+        _ => repos.sort_by_key(|r| std::cmp::Reverse(key(r))),
+    }
+
+    let total = repos.len();
+    let title = if opts.mode == ScanMode::SingleFile { "Analyzing repositories for secrets" } else { "Whole repository analysis (config-like files, not filtered by domain)" };
+    eprintln!("\n{}", "─".repeat(BOX_WIDTH).cyan());
+    eprintln!("{}", format!("  🔍 {} - {} repositories", title, total).bold().cyan());
+    eprintln!("{}", format!("  📊 Sorted by {} commit date: {}", opts.commit_date_kind, if opts.sort_order == "asc" { "oldest first" } else { "newest first" }).bold().cyan());
+    eprintln!("{}\n", "─".repeat(BOX_WIDTH).cyan());
+
+    let mut reports: Vec<RepoReport> = Vec::new();
+    for (i, repo) in repos.iter().enumerate() {
+        let report = match opts.mode {
+            ScanMode::SingleFile => scan_single(repo, token, &error_counter, opts.show_secrets).await,
+            ScanMode::WholeRepo => scan_whole(repo, token, &opts.domain, &error_counter, opts.max_files, opts.show_secrets).await,
+        };
+        if opts.quiet && report.findings.is_empty() {
+            continue;
+        }
+        if opts.json.is_none() {
+            print_report(&report, i + 1, total);
+        }
+        reports.push(report);
+    }
+
+    if let Some(dest) = &opts.json {
+        write_json(&reports, dest.as_deref());
+    }
+
+    let findings: usize = reports.iter().map(|r| r.findings.len()).sum();
+    let with_findings = reports.iter().filter(|r| !r.findings.is_empty()).count();
+    eprintln!("{}", "═".repeat(BOX_WIDTH).cyan());
+    eprintln!("{}", format!("  ✨ Done: {} repositories scanned, {} with findings, {} finding(s) total", total, with_findings, findings).bold().green());
+    eprintln!("{}\n", "═".repeat(BOX_WIDTH).cyan());
+    error_counter.print_summary();
+    findings
+}
+
+/// Write a JSON payload to stdout (`None` or `-`) or to a file.
+fn write_json<T: Serialize>(payload: &T, dest: Option<&Path>) {
+    let payload = serde_json::to_string_pretty(payload).expect("serialize to JSON");
+    match dest {
+        None => println!("{}", payload),
+        Some(path) if path == Path::new("-") => println!("{}", payload),
+        Some(path) => {
+            let mut f = std::fs::File::create(path).expect("create JSON output file");
+            f.write_all(payload.as_bytes()).expect("write JSON to file");
+        }
+    }
+}
+
 
 /// One repository entry for JSON export in list mode.
 #[derive(Debug, Serialize)]
@@ -936,21 +784,7 @@ pub async fn list_repositories(
                 files,
             });
         }
-        let payload = serde_json::to_string_pretty(&list).expect("serialize list to JSON");
-        match json_dest {
-            None => {
-                println!("{}", payload);
-            }
-            Some(path) => {
-                let path = path.as_path();
-                if path == Path::new("-") {
-                    println!("{}", payload);
-                } else {
-                    let mut f = std::fs::File::create(path).expect("create JSON output file");
-                    f.write_all(payload.as_bytes()).expect("write JSON to file");
-                }
-            }
-        }
+        write_json(&list, json_dest.as_deref());
     } else {
         // Human-readable output
         println!("\n{} Found {} repository(ies) (sorted by {} commit date)\n", "📋".green(), total_repos.to_string().bold(), kind);
@@ -986,4 +820,35 @@ pub async fn list_repositories(
     }
 
     error_counter.print_summary();
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_reports_every_match_with_line_and_masks_value() {
+        let content = "a = 1\naws_access_key_id = \"AKIAIOSFODNN7REALKEY\";\naws_secret_access_key = \"AKIAIOSFODNN7OTHERKY\";\nDB_PASSWORD = process.env.DB_PASSWORD\n";
+        let out = scan_content("c.env", "https://github.com/o/r/blob/main/c.env", content, false);
+        let aws: Vec<_> = out.findings.iter().filter(|f| f.secret_type == "AWS Access Key").collect();
+        assert_eq!(aws.len(), 2, "{:?}", out.findings);
+        assert_eq!((aws[0].line, aws[1].line), (2, 3));
+        assert!(aws[0].value.starts_with("AK****") && !aws[0].value.contains("REAL"));
+        assert!(aws[0].url.ends_with("c.env#L2"));
+        assert!(out.findings.iter().all(|f| f.line != 4));
+    }
+
+    #[test]
+    fn env_reads_are_not_findings_and_do_not_hide_other_lines() {
+        let content = "DB_PASSWORD = process.env.DB_PASSWORD\nSTRIPE_API_KEY = \"abcdef1234567890abcdef\";\n";
+        let out = scan_content("a.js", "u", content, true);
+        assert!(out.env_references.iter().any(|r| r.line == 1));
+        assert!(out.findings.iter().all(|f| f.line != 1));
+        assert!(out.findings.iter().any(|f| f.line == 2 && f.value == "abcdef1234567890abcdef"));
+    }
+
+    #[test]
+    fn mask_hides_short_and_long_values() {
+        assert_eq!(mask("short"), "****");
+        assert_eq!(mask("abcdefghijkl"), "ab****kl");
+    }
 }

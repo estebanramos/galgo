@@ -139,13 +139,22 @@ galgo -d example.com -l --json repos.json         # write to file
 
 **Single-file / whole-repo**
 
-- `-q, --quiet` — (Single-file) Only print repos that have at least one secret.
+- `-q, --quiet` — Only report repos that have at least one secret.
 - `--max-files <N>` — (Whole-repo) Max files to analyze per repository.
 
 **List**
 
 - `--exclude-ext <ext1,ext2>` — Hide these extensions from the file list.
-- `--json [FILE]` — Output list as JSON. Omit FILE to print to stdout; use `-` for stdout explicitly.
+
+**Output (all modes)**
+
+- `--json [FILE]` — Output JSON instead of boxes. Omit FILE to print to stdout; use `-` for stdout explicitly. Progress and summaries go to stderr, so `> out.json` is clean.
+- `--show-secrets` — Print full secret values (masked like `AK****LE` by default).
+- `--no-color` — Disable colors (automatic when stdout is not a terminal).
+
+**Exit codes:** `0` no secrets, `1` secrets found, `2` usage/token/API error.
+
+See `CHANGELOG_IMPROVEMENTS.md` for details on findings (line numbers, severity) and rate-limit handling.
 
 ---
 

@@ -1,9 +1,10 @@
-use reqwest::{Client, header::HeaderMap};
+use reqwest::Client;
 use serde_json::Value;
 use std::{fmt, time::Duration};
 use std::collections::HashMap;
 use std::sync::Arc;
 use colored::Colorize;
+use once_cell::sync::Lazy;
 use super::utils::{clean_file_name, clean_url, extract_file_path};
 use chrono::{DateTime, Utc};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -44,6 +45,15 @@ impl HttpErrorCounter {
         };
     }
 
+    /// Record the HTTP status embedded in an `InvalidResponse("... status N")` error, if any.
+    pub fn record_github_error_opt(&self, err: Option<&GithubError>) {
+        if let Some(GithubError::InvalidResponse(msg)) = err {
+            if let Some(code) = msg.split("status ").nth(1).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse().ok()) {
+                self.record_error(code);
+            }
+        }
+    }
+
     pub fn total_errors(&self) -> u32 {
         self.status_401.load(Ordering::Relaxed) +
         self.status_403.load(Ordering::Relaxed) +
@@ -58,35 +68,35 @@ impl HttpErrorCounter {
     pub fn print_summary(&self) {
         let total = self.total_errors();
         if total > 0 {
-            println!("\n{}", "─".repeat(80).yellow());
-            println!("{}", "  ⚠️  HTTP Error Summary".bold().yellow());
-            println!("{}", "─".repeat(80).yellow());
+            eprintln!("\n{}", "─".repeat(80).yellow());
+            eprintln!("{}", "  ⚠️  HTTP Error Summary".bold().yellow());
+            eprintln!("{}", "─".repeat(80).yellow());
             if self.status_401.load(Ordering::Relaxed) > 0 {
-                println!("  401 Unauthorized: {}", self.status_401.load(Ordering::Relaxed));
+                eprintln!("  401 Unauthorized: {}", self.status_401.load(Ordering::Relaxed));
             }
             if self.status_403.load(Ordering::Relaxed) > 0 {
-                println!("  403 Forbidden: {}", self.status_403.load(Ordering::Relaxed));
+                eprintln!("  403 Forbidden: {}", self.status_403.load(Ordering::Relaxed));
             }
             if self.status_404.load(Ordering::Relaxed) > 0 {
-                println!("  404 Not Found: {}", self.status_404.load(Ordering::Relaxed));
+                eprintln!("  404 Not Found: {}", self.status_404.load(Ordering::Relaxed));
             }
             if self.status_422.load(Ordering::Relaxed) > 0 {
-                println!("  422 Unprocessable Entity: {}", self.status_422.load(Ordering::Relaxed));
+                eprintln!("  422 Unprocessable Entity: {}", self.status_422.load(Ordering::Relaxed));
             }
             if self.status_429.load(Ordering::Relaxed) > 0 {
-                println!("  429 Rate Limit Exceeded: {}", self.status_429.load(Ordering::Relaxed));
+                eprintln!("  429 Rate Limit Exceeded: {}", self.status_429.load(Ordering::Relaxed));
             }
             if self.status_500.load(Ordering::Relaxed) > 0 {
-                println!("  500 Internal Server Error: {}", self.status_500.load(Ordering::Relaxed));
+                eprintln!("  500 Internal Server Error: {}", self.status_500.load(Ordering::Relaxed));
             }
             if self.status_503.load(Ordering::Relaxed) > 0 {
-                println!("  503 Service Unavailable: {}", self.status_503.load(Ordering::Relaxed));
+                eprintln!("  503 Service Unavailable: {}", self.status_503.load(Ordering::Relaxed));
             }
             if self.other_errors.load(Ordering::Relaxed) > 0 {
-                println!("  Other Errors: {}", self.other_errors.load(Ordering::Relaxed));
+                eprintln!("  Other Errors: {}", self.other_errors.load(Ordering::Relaxed));
             }
-            println!("  {} Total HTTP Errors: {}", "⚠️".red(), total.to_string().red().bold());
-            println!("{}\n", "─".repeat(80).yellow());
+            eprintln!("  {} Total HTTP Errors: {}", "⚠️".red(), total.to_string().red().bold());
+            eprintln!("{}\n", "─".repeat(80).yellow());
         }
     }
 }
@@ -133,22 +143,79 @@ impl fmt::Display for GithubError {
     }
 }
 
-fn create_github_client() -> Result<Client, GithubError> {
-    let mut headers = HeaderMap::new();
-    headers.insert("User-Agent", USER_AGENT.parse().map_err(|e| {
-        GithubError::InvalidResponse(format!("Invalid User-Agent header: {}", e))
-    })?);
+/// One HTTP client for the whole run: reuses the connection pool and TLS sessions.
+static CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
-        .pool_max_idle_per_host(50)  // Increased connection pool for better performance
+        .user_agent(USER_AGENT)
+        .pool_max_idle_per_host(50)
         .pool_idle_timeout(Duration::from_secs(120))
-        .timeout(Duration::from_secs(30))  // Add timeout to prevent hanging requests
-        .default_headers(headers)
+        .timeout(Duration::from_secs(30))
         .build()
-        .map_err(GithubError::RequestError)
+        .expect("failed to build HTTP client")
+});
+
+/// Longest we are willing to sleep for a single rate-limit window before giving up.
+const MAX_RATE_LIMIT_WAIT_SECS: u64 = 120;
+const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+
+/// Seconds to wait before retrying, taken from `Retry-After` or `X-RateLimit-Reset`.
+fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let num = |name: &str| headers.get(name)?.to_str().ok()?.parse::<u64>().ok();
+    if let Some(secs) = num("retry-after") {
+        return Some(secs);
+    }
+    if num("x-ratelimit-remaining") == Some(0) {
+        let reset = num("x-ratelimit-reset")?;
+        return Some(reset.saturating_sub(Utc::now().timestamp() as u64) + 1);
+    }
+    None
 }
 
-/// Search GitHub API for a given domain with pagination support
-/// Returns a HashMap of unique repositories and error counter
+/// GET `url` and return `(status, body)`.
+/// Primary and secondary rate limits are handled here, once for every endpoint:
+/// the request sleeps until the window resets (up to `MAX_RATE_LIMIT_WAIT_SECS`) and is retried.
+pub async fn get_text(token: &str, url: &str, accept: Option<&str>) -> Result<(u16, String), GithubError> {
+    let mut attempt = 0;
+    loop {
+        let mut req = CLIENT.get(url).bearer_auth(token);
+        if let Some(a) = accept {
+            req = req.header("Accept", a);
+        }
+        let resp = req.send().await.map_err(GithubError::RequestError)?;
+        let status = resp.status().as_u16();
+        let wait = rate_limit_wait(resp.headers());
+        let body = resp.text().await.map_err(GithubError::RequestError)?;
+
+        let limited = status == 429
+            || (status == 403 && (wait.is_some() || body.to_lowercase().contains("rate limit")));
+        if !limited {
+            return Ok((status, body));
+        }
+
+        // shortcut: secondary limits without a header wait a flat 60s, upgrade if GitHub documents a better signal.
+        let secs = wait.unwrap_or(60);
+        if attempt >= MAX_RATE_LIMIT_RETRIES || secs > MAX_RATE_LIMIT_WAIT_SECS {
+            return Err(GithubError::RateLimitExceeded(format!(
+                "GitHub API rate limit exceeded (resets in {}s). Response: {}", secs, body
+            )));
+        }
+        attempt += 1;
+        eprintln!("{}", format!("⏳ Rate limited, waiting {}s (retry {}/{})...", secs, attempt, MAX_RATE_LIMIT_RETRIES).yellow());
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+    }
+}
+
+/// GET and parse a JSON body; any non-2xx status becomes `InvalidResponse("Failed to get <what>: status N")`.
+async fn get_json(token: &str, url: &str, accept: Option<&str>, what: &str) -> Result<Value, GithubError> {
+    let (status, body) = get_text(token, url, accept).await?;
+    if !(200..300).contains(&status) {
+        return Err(GithubError::InvalidResponse(format!("Failed to get {}: status {}", what, status)));
+    }
+    serde_json::from_str(&body).map_err(|e| GithubError::InvalidResponse(format!("Failed to parse JSON: {}", e)))
+}
+
+/// Search GitHub code for a domain, with pagination.
+/// Returns the unique repositories (every matching file is attached to its repository) and the error counter.
 /// max_repos: Optional limit on number of unique repositories to return (None = unlimited, up to API limits)
 /// include_ext: When set, the GitHub Code Search API is restricted to these file extensions (e.g. ["rs", "toml"]).
 pub async fn search(
@@ -159,21 +226,19 @@ pub async fn search(
 ) -> Result<(HashMap<String, Repository>, HttpErrorCounter), GithubError> {
     const PER_PAGE: usize = 100;
     const MAX_TOTAL_RESULTS: usize = 1000; // GitHub API limit for code search
-    
-    let client = create_github_client()?;
+
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS));
     let error_counter = HttpErrorCounter::new();
     let mut repository_list: HashMap<String, Repository> = HashMap::new();
     let mut page = 1;
     let mut total_items_processed = 0;
-    
+
     use indicatif::{ProgressBar, ProgressStyle};
-    
-    println!("\n{}", "═".repeat(80).cyan());
-    println!("{}", format!("  🔍 Step 1/3: Searching GitHub for repositories matching '{}'", domain).bold().cyan());
-    println!("{}\n", "═".repeat(80).cyan());
-    
-    // Create progress bar for search with custom spinner style
+
+    eprintln!("\n{}", "═".repeat(80).cyan());
+    eprintln!("{}", format!("  🔍 Step 1/3: Searching GitHub for repositories matching '{}'", domain).bold().cyan());
+    eprintln!("{}\n", "═".repeat(80).cyan());
+
     let search_pb = ProgressBar::new_spinner();
     search_pb.set_style(ProgressStyle::default_spinner()
         .template("{spinner:.cyan.bold} {msg:.cyan}")
@@ -181,12 +246,12 @@ pub async fn search(
         .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]));
     search_pb.set_message("Searching GitHub API...");
     search_pb.enable_steady_tick(std::time::Duration::from_millis(80));
-    
+
     // Will be initialized on first page
     let mut commit_pb: Option<ProgressBar> = None;
     // When API returns 422 with extension qualifier, we retry with domain-only and filter client-side
     let mut query_override: Option<String> = None;
-    
+
     loop {
         // Build search query: domain + optional extension qualifiers.
         // Legacy Code Search API does not support parentheses; use "domain extension:py" or "domain extension:rs OR extension:toml".
@@ -197,15 +262,9 @@ pub async fn search(
                 Some(exts) if !exts.is_empty() => {
                     let ext_clause: String = exts
                         .iter()
-                        .map(|e| {
-                            let e = e.trim().trim_start_matches('.').to_lowercase();
-                            if e.is_empty() {
-                                String::new()
-                            } else {
-                                format!("extension:{}", e)
-                            }
-                        })
-                        .filter(|s| !s.is_empty())
+                        .map(|e| e.trim().trim_start_matches('.').to_lowercase())
+                        .filter(|e| !e.is_empty())
+                        .map(|e| format!("extension:{}", e))
                         .collect::<Vec<_>>()
                         .join(" OR ");
                     if ext_clause.is_empty() {
@@ -221,51 +280,18 @@ pub async fn search(
         let q_encoded = query.replace(' ', "+");
         let url = format!("https://api.github.com/search/code?per_page={}&s=indexed&type=Code&o=desc&q={}&page={}",
                          PER_PAGE, q_encoded, page);
-        
-        let response = client.get(&url)
-            .header("User-Agent", "Galgo App")
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(GithubError::RequestError)?;
-        
-        let status = response.status().as_u16();
-        if !response.status().is_success() {
+
+        let (status, body) = get_text(token, &url, None).await?;
+        if !(200..300).contains(&status) {
             error_counter.record_error(status);
-            
-            // Read the body once for all error handling
-            let body = response.text().await.map_err(GithubError::RequestError)?;
-            
-            // Check for rate limit errors (403 or 429 with rate limit message)
-            if status == 403 || status == 429 {
-                let is_rate_limit = body.contains("API rate limit exceeded") 
-                    || body.contains("rate limit")
-                    || body.contains("X-RateLimit-Remaining")
-                    || body.contains("rate limiting")
-                    || status == 429;
-                
-                if is_rate_limit {
-                    let error_msg = format!("GitHub API rate limit exceeded. Please wait before trying again.\nResponse: {}", body);
-                    eprintln!("\n{}", "═".repeat(80).red());
-                    eprintln!("{}", "  ⛔ RATE LIMIT EXCEEDED".bold().red());
-                    eprintln!("{}", "═".repeat(80).red());
-                    eprintln!("{}", error_msg);
-                    eprintln!("{}", "═".repeat(80).red());
-                    eprintln!();
-                    return Err(GithubError::RateLimitExceeded(error_msg));
-                }
-                
-                // If 403 but not rate limit, handle as forbidden
-                if status == 403 {
-                    eprintln!("[403] Forbidden: {}", body);
-                    return Err(GithubError::InvalidResponse(format!("Forbidden: {}", body)));
-                }
-            }
-            
             match status {
                 401 => {
                     eprintln!("[401] Unauthorized => most likely the token is invalid or expired");
                     return Err(GithubError::InvalidResponse("Unauthorized".to_string()));
+                }
+                403 => {
+                    eprintln!("[403] Forbidden: {}", body);
+                    return Err(GithubError::InvalidResponse(format!("Forbidden: {}", body)));
                 }
                 422 => {
                     // Invalid query (e.g. extension qualifier not accepted). Retry without extension once.
@@ -280,39 +306,33 @@ pub async fn search(
                     break; // Stop pagination
                 }
                 _ => {
-                    // Continue but record the error
                     eprintln!("[{}] Error fetching page {}, continuing...", status, page);
                     page += 1;
+                    // Search never serves more than MAX_TOTAL_RESULTS hits; do not loop forever on a persistent 5xx.
+                    if page > MAX_TOTAL_RESULTS / PER_PAGE {
+                        break;
+                    }
                     continue;
                 }
             }
         }
 
-        let body = response.text().await.map_err(GithubError::RequestError)?;
         let json: Value = serde_json::from_str(&body)
             .map_err(|e| GithubError::InvalidResponse(format!("Failed to parse JSON: {}", e)))?;
-        
+
         let items = json["items"].as_array()
             .ok_or_else(|| GithubError::InvalidResponse("Missing 'items' array in response".to_string()))?;
-        
+
         let total_count = json["total_count"].as_u64().unwrap_or(0);
-        
+
         if page == 1 {
             search_pb.finish_with_message("✅ Found matches, processing...");
-            // Calculate the actual number of repos we'll process (limited by max_repos if set)
-            let repos_to_process = if let Some(limit) = max_repos {
-                total_count.min(limit as u64)
-            } else {
-                total_count.min(MAX_TOTAL_RESULTS as u64)
-            };
-            let step2_msg = format!("  🔄 Step 2/3: Fetching commit dates for {} repositories...", repos_to_process);
-            println!("\n{}", "─".repeat(80).cyan());
-            println!("{}", step2_msg.bold().cyan());
-            println!("{}\n", "─".repeat(80).cyan());
-            
-            // Create progress bar for commit dates (Step 2) with gradient style
-            // Limit bar width to fit within 80 char box width
-            let pb = ProgressBar::new(repos_to_process);
+            let hits_to_process = total_count.min(MAX_TOTAL_RESULTS as u64);
+            eprintln!("\n{}", "─".repeat(80).cyan());
+            eprintln!("{}", format!("  🔄 Step 2/3: Fetching commit dates ({} matching files)...", hits_to_process).bold().cyan());
+            eprintln!("{}\n", "─".repeat(80).cyan());
+
+            let pb = ProgressBar::new(hits_to_process);
             pb.set_style(ProgressStyle::default_bar()
                 .template("{spinner:.yellow} [{elapsed_precise}] [{bar:20.yellow/blue}] {pos:>4}/{len:4} ({percent:>3}%) {msg:.dim}")
                 .unwrap()
@@ -321,309 +341,143 @@ pub async fn search(
             pb.enable_steady_tick(std::time::Duration::from_millis(100));
             commit_pb = Some(pb);
         }
-        
-        // Update search progress (simplified to avoid lifetime issues)
+
         if page > 1 {
             search_pb.set_message("Fetching more pages...");
         }
-        
+
         if items.is_empty() {
-            // No more results
             break;
         }
-        
-        // Collect repository info first (without commit dates)
-        let mut repo_data: Vec<(String, String, String, String, String, String, String)> = Vec::new();
+
+        // Group hits by repository: every matching file of a repo is analysed, not just the first one.
+        // `new_repos` holds repositories first seen on this page, with the commits URL needed for their dates.
+        let mut new_repos: Vec<(Repository, String)> = Vec::new();
         for x in items {
-            // Check if we've reached the repository limit
-            if let Some(limit) = max_repos {
-                if repository_list.len() >= limit {
-                    println!("   ✅ Reached maximum repository limit ({})", limit);
-                    break;
+            let missing = |field: &str| GithubError::InvalidResponse(format!("Missing {}", field));
+            let file_url = x["html_url"].as_str().ok_or_else(|| missing("html_url"))?.to_string();
+            let file_url_api = x["url"].as_str().ok_or_else(|| missing("url"))?.to_string();
+            let repository_name = x["repository"]["name"].as_str().ok_or_else(|| missing("repository name"))?.to_string();
+            let repository_url = x["repository"]["html_url"].as_str().ok_or_else(|| missing("repository html_url"))?.to_string();
+
+            let existing = repository_list.get_mut(&repository_url)
+                .or_else(|| new_repos.iter_mut().find(|(r, _)| r.repository_url == repository_url).map(|(r, _)| r));
+            if let Some(repo) = existing {
+                if !repo.files_urls.contains(&file_url) {
+                    repo.files_names.push(clean_file_name(file_url.clone()));
+                    repo.files_urls.push(file_url);
+                    repo.files_urls_api.push(file_url_api);
                 }
-            }
-            
-            let file_url = x["html_url"].as_str()
-                .ok_or_else(|| GithubError::InvalidResponse("Missing html_url".to_string()))?
-                .to_string();
-            let file_url_api = x["url"].as_str()
-                .ok_or_else(|| GithubError::InvalidResponse("Missing url".to_string()))?
-                .to_string();
-            let clean_file = clean_file_name(file_url.clone());
-            let repository_name = x["repository"]["name"].as_str()
-                .ok_or_else(|| GithubError::InvalidResponse("Missing repository name".to_string()))?
-                .to_string();
-            let repository_url = x["repository"]["html_url"].as_str()
-                .ok_or_else(|| GithubError::InvalidResponse("Missing repository html_url".to_string()))?
-                .to_string();
-            
-            // Skip if we already have this repository
-            if repository_list.contains_key(&repository_url) {
                 continue;
             }
-            
-            let commits_url = x["repository"]["commits_url"].as_str()
-                .ok_or_else(|| GithubError::InvalidResponse("Missing commits_url".to_string()))?
-                .to_string()
-                .replace("{/sha}", "");
-            let author = x["repository"]["owner"]["html_url"].as_str()
-                .ok_or_else(|| GithubError::InvalidResponse("Missing owner html_url".to_string()))?
-                .to_string();
-            
-            repo_data.push((repository_url.clone(), repository_name.clone(), author.clone(), 
-                          file_url.clone(), file_url_api.clone(), clean_file.clone(), commits_url.clone()));
-        }
-        
-        // Fetch commit dates in parallel
-        let token_arc = Arc::new(token.to_string());
-        let error_counter_arc = Arc::new(error_counter.clone());
-        let semaphore_clone = semaphore.clone();
-        
-        // Use atomic counter to track progress
-        use std::sync::atomic::{AtomicU64, Ordering};
-        let progress_counter = Arc::new(AtomicU64::new(0));
-        let progress_counter_clone = progress_counter.clone();
-        let commit_pb_ref = commit_pb.as_ref();
-        
-        let commit_futures: Vec<_> = repo_data.iter().map(|(repo_url, _repo_name, _author, file_url, _file_url_api, _clean_file, commits_url)| {
-            let token_clone = token_arc.clone();
-            let error_counter_clone = error_counter_arc.clone();
-            let semaphore_clone = semaphore_clone.clone();
-            let commits_url_clone = commits_url.clone();
-            let repo_url_clone = repo_url.clone();
-            let progress_counter_task = progress_counter_clone.clone();
-            let file_path = extract_file_path(file_url);
-            
-            async move {
-                let _permit = semaphore_clone.acquire().await.unwrap();
-                // Fetch both: last commit on repo (no path) and last commit that touched the file (with path)
-                let (repo_result, file_result) = tokio::join!(
-                    get_last_commit_date(&token_clone, commits_url_clone.clone(), None),
-                    get_last_commit_date(&token_clone, commits_url_clone.clone(), Some(file_path.as_str())),
-                );
-                let last_commit_date = repo_result.unwrap_or_else(|e| {
-                    if let GithubError::InvalidResponse(msg) = &e {
-                        if msg.contains("status") {
-                            error_counter_clone.record_error(404);
-                        }
-                    }
-                    Utc::now()
-                });
-                let last_commit_date_file = file_result.unwrap_or_else(|e| {
-                    if let GithubError::InvalidResponse(msg) = &e {
-                        if msg.contains("status") {
-                            error_counter_clone.record_error(404);
-                        }
-                    }
-                    Utc::now()
-                });
-                
-                // Update progress counter when this future completes
-                let current = progress_counter_task.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(pb) = commit_pb_ref {
-                    pb.set_position(current);
+
+            if let Some(limit) = max_repos {
+                if repository_list.len() + new_repos.len() >= limit {
+                    continue;
                 }
-                
-                Ok((repo_url_clone, last_commit_date, last_commit_date_file))
             }
-        }).collect();
-        
-        // Wait for all commit dates in parallel (progress bar updates as each completes)
-        let commit_results: Vec<Result<(String, DateTime<Utc>, DateTime<Utc>), GithubError>> = futures::future::join_all(commit_futures).await;
-        
-        // Process results and build repository list
-        for (i, result) in commit_results.into_iter().enumerate() {
-            if i < repo_data.len() {
-                let (repository_url, repository_name, author, file_url, file_url_api, clean_file, _) = &repo_data[i];
-                
-                let (last_commit_date, last_commit_date_file) = match result {
-                    Ok((_, repo_date, file_date)) => (repo_date, file_date),
-                    Err(_) => (Utc::now(), Utc::now()),
-                };
-                
-                let repository = Repository {
-                    repository_url: repository_url.clone(),
-                    repository_name: repository_name.clone(),
-                    author: author.clone(),
-                    files_urls: vec![file_url.clone()],
-                    files_urls_api: vec![file_url_api.clone()],
-                    files_names: vec![clean_file.clone()],
-                    last_commit_date,
-                    last_commit_date_file,
-                };
-                
-                repository_list.insert(repository_url.clone(), repository);
-                total_items_processed += 1;
-            }
+
+            let commits_url = x["repository"]["commits_url"].as_str().ok_or_else(|| missing("commits_url"))?
+                .replace("{/sha}", "");
+            let author = x["repository"]["owner"]["html_url"].as_str().ok_or_else(|| missing("owner html_url"))?.to_string();
+
+            new_repos.push((Repository {
+                repository_url,
+                repository_name,
+                author,
+                files_names: vec![clean_file_name(file_url.clone())],
+                files_urls: vec![file_url],
+                files_urls_api: vec![file_url_api],
+                last_commit_date: Utc::now(),
+                last_commit_date_file: Utc::now(),
+            }, commits_url));
         }
-        
-        // Check if we should continue pagination
+        total_items_processed += items.len();
+        if let Some(pb) = &commit_pb {
+            pb.set_position(total_items_processed as u64);
+        }
+
+        // Fetch repo and file commit dates in parallel (dates are those of the first matching file)
+        let date_futures = new_repos.iter().map(|(repo, commits_url)| {
+            let semaphore = semaphore.clone();
+            let counter = error_counter.clone();
+            let file_path = extract_file_path(&repo.files_urls[0]);
+            async move {
+                let _permit = semaphore.acquire().await.unwrap();
+                let (repo_date, file_date) = tokio::join!(
+                    get_last_commit_date(token, commits_url.clone(), None),
+                    get_last_commit_date(token, commits_url.clone(), Some(file_path.as_str())),
+                );
+                counter.record_github_error_opt(repo_date.as_ref().err());
+                counter.record_github_error_opt(file_date.as_ref().err());
+                (repo_date.unwrap_or_else(|_| Utc::now()), file_date.unwrap_or_else(|_| Utc::now()))
+            }
+        });
+        let dates = futures::future::join_all(date_futures).await;
+        for ((mut repo, _), (repo_date, file_date)) in new_repos.into_iter().zip(dates) {
+            repo.last_commit_date = repo_date;
+            repo.last_commit_date_file = file_date;
+            repository_list.insert(repo.repository_url.clone(), repo);
+        }
+
         if let Some(limit) = max_repos {
             if repository_list.len() >= limit {
                 break;
             }
         }
-        
-        // Check if we got less than PER_PAGE results (last page)
+
+        // Fewer than PER_PAGE results means this was the last page
         if items.len() < PER_PAGE {
             break;
         }
-        
-        // Check if we've reached GitHub's API limit
+
         if total_items_processed >= MAX_TOTAL_RESULTS {
-            println!("   ⚠️  Reached GitHub API limit ({} results)", MAX_TOTAL_RESULTS);
+            eprintln!("   ⚠️  Reached GitHub API limit ({} results)", MAX_TOTAL_RESULTS);
             break;
         }
-        
+
         page += 1;
         search_pb.set_message("Fetching more pages...");
-        
-        // Minimal delay to respect rate limits (reduced from 100ms to 50ms for better performance)
-        // GitHub API allows 5000 requests/hour for authenticated users, so we can be more aggressive
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
-    
+
     search_pb.finish_with_message("✅ Search complete!");
-    
-    // Finish commit progress bar if it exists
     if let Some(pb) = commit_pb {
         pb.finish_with_message("✅ Commit dates fetched!");
     }
-    
-    let repo_count = repository_list.len();
-    println!("\n{}", "─".repeat(80).cyan());
-    println!("{}", format!("  📊 Step 3/3: Found {} unique repositories", repo_count).bold().cyan());
-    println!("{}\n", "─".repeat(80).cyan());
-    
+
+    let file_count: usize = repository_list.values().map(|r| r.files_urls.len()).sum();
+    eprintln!("\n{}", "─".repeat(80).cyan());
+    eprintln!("{}", format!("  📊 Step 3/3: Found {} unique repositories ({} matching files)", repository_list.len(), file_count).bold().cyan());
+    eprintln!("{}\n", "─".repeat(80).cyan());
+
     Ok((repository_list, error_counter))
 }
 
-#[allow(dead_code)]
-pub async fn get_raw_file_content(url: String, token: &str) -> Result<String, GithubError> {
-    let content_url = url.clone();
-    let raw_url = content_url.replace("/blob", "").replace("https://github.com/", "https://raw.githubusercontent.com/").replace("\"", "");
-    let client = create_github_client()?;
-    let response = client.get(raw_url)
-        .header("User-Agent", "Galgo App")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github.v3.raw")
-        .send()
-        .await
-        .map_err(GithubError::RequestError)?;
-    match response.status().is_success() {
-        true => {
-            let body = response.text().await.map_err(GithubError::RequestError)?;
-            return Ok(body);
-        }
-        false => {
-            return Err(GithubError::InvalidResponse(format!("Failed to get raw file content: {}", response.status())));
-        }
-    }
-}
-
+/// Fetch a file through the contents API (raw media type: no JSON, no base64).
 pub async fn get_raw_file_content_from_api(url: String, token: &str) -> Result<String, GithubError> {
-    // Usar la API de GitHub en lugar de raw CDN
-    let client = create_github_client()?;
-    let cleaned_url = clean_url(&url);
-    let response = client.get(&cleaned_url)
-        .header("User-Agent", "Galgo App")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github.raw")
-        .send()
-        .await
-        .map_err(GithubError::RequestError)?;
-    
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        // Check for rate limit errors
-        if status == 403 || status == 429 {
-            let body = response.text().await.map_err(GithubError::RequestError)?;
-            let is_rate_limit = body.contains("API rate limit exceeded") 
-                || body.contains("rate limit")
-                || body.contains("X-RateLimit-Remaining")
-                || body.contains("rate limiting")
-                || status == 429;
-            
-            if is_rate_limit {
-                let error_msg = format!("GitHub API rate limit exceeded. Please wait before trying again.\nResponse: {}", body);
-                eprintln!("\n{}", "═".repeat(80).red());
-                eprintln!("{}", "  ⛔ RATE LIMIT EXCEEDED".bold().red());
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!("{}", error_msg);
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!();
-                return Err(GithubError::RateLimitExceeded(error_msg));
-            }
-        }
+    let (status, body) = get_text(token, &clean_url(&url), Some("application/vnd.github.raw")).await?;
+    if !(200..300).contains(&status) {
         return Err(GithubError::InvalidResponse(format!("Failed to get raw file content: status {}", status)));
     }
-    
-    let body = response.text().await.map_err(GithubError::RequestError)?;
     Ok(body)
 }
 
 /// Fetches the date of the last commit. If `path` is Some, requests commits for that file only (last commit that touched the file).
 pub async fn get_last_commit_date(token: &str, mut url: String, path: Option<&str>) -> Result<DateTime<Utc>, GithubError> {
-    if let Some(p) = path {
-        if !p.is_empty() {
-            url.push('?');
-            url.push_str("path=");
-            url.push_str(&urlencoding::encode(p).to_string());
-        }
+    if let Some(p) = path.filter(|p| !p.is_empty()) {
+        url.push_str("?path=");
+        url.push_str(&urlencoding::encode(p));
     }
-    let client = create_github_client()?;
-    let response = client.get(&url)
-        .header("User-Agent", "Galgo App")
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(GithubError::RequestError)?;
-    
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        // Check for rate limit errors
-        if status == 403 || status == 429 {
-            let body = response.text().await.map_err(GithubError::RequestError)?;
-            let is_rate_limit = body.contains("API rate limit exceeded") 
-                || body.contains("rate limit")
-                || body.contains("X-RateLimit-Remaining")
-                || body.contains("rate limiting")
-                || status == 429;
-            
-            if is_rate_limit {
-                let error_msg = format!("GitHub API rate limit exceeded. Please wait before trying again.\nResponse: {}", body);
-                eprintln!("\n{}", "═".repeat(80).red());
-                eprintln!("{}", "  ⛔ RATE LIMIT EXCEEDED".bold().red());
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!("{}", error_msg);
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!();
-                return Err(GithubError::RateLimitExceeded(error_msg));
-            }
-        }
-        return Err(GithubError::InvalidResponse(format!("Failed to get commit date: status {}", status)));
-    }
-    
-    let response_text = response.text().await.map_err(GithubError::RequestError)?;
-    let json: Value = serde_json::from_str(&response_text)
-        .map_err(|e| GithubError::InvalidResponse(format!("Failed to parse JSON: {}", e)))?;
-    
-    // Manejo seguro del acceso a la fecha
+    let json = get_json(token, &url, None, "commit date").await?;
     let commits = json.as_array()
         .ok_or_else(|| GithubError::InvalidResponse("Expected array of commits".to_string()))?;
-    
-    if commits.is_empty() {
-        return Err(GithubError::InvalidResponse("No commits found".to_string()));
-    }
-    
-    let last_commit_date = commits[0]["commit"]["committer"]["date"]
+    let date = commits.first()
+        .ok_or_else(|| GithubError::InvalidResponse("No commits found".to_string()))?["commit"]["committer"]["date"]
         .as_str()
         .ok_or_else(|| GithubError::InvalidResponse("Missing commit date".to_string()))?;
-    
-    let parsed_date = DateTime::parse_from_rfc3339(last_commit_date)
+    Ok(DateTime::parse_from_rfc3339(date)
         .map_err(|e| GithubError::InvalidResponse(format!("Failed to parse date: {}", e)))?
-        .with_timezone(&Utc);
-    Ok(parsed_date)
+        .with_timezone(&Utc))
 }
 
 /// Extract owner and repo name from GitHub repository URL
@@ -633,7 +487,7 @@ pub fn extract_repo_info(repo_url: &str) -> Option<(String, String)> {
         .replace("https://github.com/", "")
         .replace("http://github.com/", "");
     let parts: Vec<&str> = cleaned.split('/').collect();
-    
+
     if parts.len() >= 2 {
         Some((parts[0].to_string(), parts[1].to_string()))
     } else {
@@ -652,126 +506,29 @@ pub struct RepoMetadata {
     pub is_archived: bool,
 }
 
-/// Get repository metadata (branch, description, topics, etc.)
+/// Get repository metadata (branch, description, topics, etc.) in a single request
 pub async fn get_repo_metadata(token: &str, owner: &str, repo: &str) -> Result<RepoMetadata, GithubError> {
-    let client = create_github_client()?;
     let url = format!("https://api.github.com/repos/{}/{}", owner, repo);
-    
-    let response = client.get(&url)
-        .header("User-Agent", "Galgo App")
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(GithubError::RequestError)?;
-    
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        // Read body once for error handling
-        let body = response.text().await.map_err(GithubError::RequestError)?;
-        
-        // Check for rate limit errors
-        if status == 403 || status == 429 {
-            let is_rate_limit = body.contains("API rate limit exceeded") 
-                || body.contains("rate limit")
-                || body.contains("X-RateLimit-Remaining")
-                || body.contains("rate limiting")
-                || status == 429;
-            
-            if is_rate_limit {
-                let error_msg = format!("GitHub API rate limit exceeded. Please wait before trying again.\nResponse: {}", body);
-                eprintln!("\n{}", "═".repeat(80).red());
-                eprintln!("{}", "  ⛔ RATE LIMIT EXCEEDED".bold().red());
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!("{}", error_msg);
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!();
-                return Err(GithubError::RateLimitExceeded(error_msg));
-            }
-        }
-        return Err(GithubError::InvalidResponse(format!("Failed to get repo info: status {}", status)));
-    }
-    
-    let body = response.text().await.map_err(GithubError::RequestError)?;
-    let json: Value = serde_json::from_str(&body)
-        .map_err(|e| GithubError::InvalidResponse(format!("Failed to parse JSON: {}", e)))?;
-    
+    let json = get_json(token, &url, None, "repo info").await?;
+
     let default_branch = json["default_branch"]
         .as_str()
         .ok_or_else(|| GithubError::InvalidResponse("Missing default_branch".to_string()))?
         .to_string();
-    
-    let description = json["description"].as_str().map(|s| s.to_string());
-    let is_archived = json["archived"].as_bool().unwrap_or(false);
-    
-    // Get topics from the topics endpoint (more reliable)
-    let topics_url = format!("https://api.github.com/repos/{}/{}/topics", owner, repo);
-    let topics_response = client.get(&topics_url)
-        .header("User-Agent", "Galgo App")
-        .header("Authorization", format!("Bearer {}", token))
-        .header("Accept", "application/vnd.github.mercy-preview+json")
-        .send()
-        .await;
-    
-    let topics = if let Ok(resp) = topics_response {
-        let topics_status = resp.status().as_u16();
-        // Read body once for both rate limit check and success case
-        let topics_body = resp.text().await.unwrap_or_default();
-        
-        // Check for rate limit in topics response
-        if topics_status == 403 || topics_status == 429 {
-            let is_rate_limit = topics_body.contains("API rate limit exceeded") 
-                || topics_body.contains("rate limit")
-                || topics_body.contains("X-RateLimit-Remaining")
-                || topics_body.contains("rate limiting")
-                || topics_status == 429;
-            
-            if is_rate_limit {
-                let error_msg = format!("GitHub API rate limit exceeded. Please wait before trying again.\nResponse: {}", topics_body);
-                eprintln!("\n{}", "═".repeat(80).red());
-                eprintln!("{}", "  ⛔ RATE LIMIT EXCEEDED".bold().red());
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!("{}", error_msg);
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!();
-                return Err(GithubError::RateLimitExceeded(error_msg));
-            }
-        }
-        
-        // If successful, parse the body
-        if topics_status == 200 && !topics_body.is_empty() {
-            if let Ok(topics_json) = serde_json::from_str::<Value>(&topics_body) {
-                topics_json["names"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
-    
+
+    // The repo object already carries its topics: no second request to /topics needed.
+    let topics = json["topics"].as_array()
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+
     Ok(RepoMetadata {
         default_branch,
-        description,
+        description: json["description"].as_str().map(String::from),
         topics,
         owner: owner.to_string(),
         name: repo.to_string(),
-        is_archived,
+        is_archived: json["archived"].as_bool().unwrap_or(false),
     })
-}
-
-/// Get default branch for a repository
-pub async fn get_default_branch(token: &str, owner: &str, repo: &str) -> Result<String, GithubError> {
-    let metadata = get_repo_metadata(token, owner, repo).await?;
-    Ok(metadata.default_branch)
 }
 
 /// Check if a repository should be scanned based on various criteria
@@ -863,163 +620,45 @@ pub fn should_scan_repository(metadata: &RepoMetadata, domain: &str) -> (bool, O
     (true, None)
 }
 
+
 /// Get all files in a repository recursively
 pub async fn get_repo_files_recursive(token: &str, owner: &str, repo: &str, branch: &str) -> Result<Vec<(String, String)>, GithubError> {
     // Use Git Trees API with recursive=1 to get all files
-    let client = create_github_client()?;
     let url = format!("https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1", owner, repo, branch);
-    
-    let response = client.get(&url)
-        .header("User-Agent", "Galgo App")
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(GithubError::RequestError)?;
-    
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        // Read body once for error handling
-        let body = response.text().await.map_err(GithubError::RequestError)?;
-        
-        // Check for rate limit errors
-        if status == 403 || status == 429 {
-            let is_rate_limit = body.contains("API rate limit exceeded") 
-                || body.contains("rate limit")
-                || body.contains("X-RateLimit-Remaining")
-                || body.contains("rate limiting")
-                || status == 429;
-            
-            if is_rate_limit {
-                let error_msg = format!("GitHub API rate limit exceeded. Please wait before trying again.\nResponse: {}", body);
-                eprintln!("\n{}", "═".repeat(80).red());
-                eprintln!("{}", "  ⛔ RATE LIMIT EXCEEDED".bold().red());
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!("{}", error_msg);
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!();
-                return Err(GithubError::RateLimitExceeded(error_msg));
-            }
-        }
-        return Err(GithubError::InvalidResponse(format!("Failed to get repo tree: status {}", status)));
-    }
-    
-    let body = response.text().await.map_err(GithubError::RequestError)?;
-    let json: Value = serde_json::from_str(&body)
-        .map_err(|e| GithubError::InvalidResponse(format!("Failed to parse JSON: {}", e)))?;
-    
+    let json = get_json(token, &url, None, "repo tree").await?;
+
     let tree = json["tree"].as_array()
         .ok_or_else(|| GithubError::InvalidResponse("Missing tree array".to_string()))?;
-    
-    let mut files: Vec<(String, String)> = Vec::new();
-    
-    for item in tree {
-        let file_type = item["type"].as_str().unwrap_or("");
-        if file_type == "blob" {
-            if let (Some(path), Some(sha)) = (item["path"].as_str(), item["sha"].as_str()) {
-                files.push((path.to_string(), sha.to_string()));
-            }
-        }
-    }
-    
-    Ok(files)
+
+    Ok(tree.iter()
+        .filter(|item| item["type"].as_str() == Some("blob"))
+        .filter_map(|item| Some((item["path"].as_str()?.to_string(), item["sha"].as_str()?.to_string())))
+        .collect())
 }
 
 /// Get file content by SHA
 pub async fn get_file_content_by_sha(token: &str, owner: &str, repo: &str, sha: &str) -> Result<String, GithubError> {
-    let client = create_github_client()?;
     let url = format!("https://api.github.com/repos/{}/{}/git/blobs/{}", owner, repo, sha);
-    
-    let response = client.get(&url)
-        .header("User-Agent", "Galgo App")
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(GithubError::RequestError)?;
-    
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        // Check for rate limit errors
-        if status == 403 || status == 429 {
-            let body = response.text().await.map_err(GithubError::RequestError)?;
-            let is_rate_limit = body.contains("API rate limit exceeded") 
-                || body.contains("rate limit")
-                || body.contains("X-RateLimit-Remaining")
-                || body.contains("rate limiting")
-                || status == 429;
-            
-            if is_rate_limit {
-                let error_msg = format!("GitHub API rate limit exceeded. Please wait before trying again.\nResponse: {}", body);
-                eprintln!("\n{}", "═".repeat(80).red());
-                eprintln!("{}", "  ⛔ RATE LIMIT EXCEEDED".bold().red());
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!("{}", error_msg);
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!();
-                return Err(GithubError::RateLimitExceeded(error_msg));
-            }
-        }
-        return Err(GithubError::InvalidResponse(format!("Failed to get file content: status {}", status)));
-    }
-    
-    let body = response.text().await.map_err(GithubError::RequestError)?;
-    let json: Value = serde_json::from_str(&body)
-        .map_err(|e| GithubError::InvalidResponse(format!("Failed to parse JSON: {}", e)))?;
-    
-    // Check encoding - GitHub API returns base64 encoded content
+    let json = get_json(token, &url, None, "file content").await?;
+
     let encoding = json["encoding"].as_str().unwrap_or("");
     let content = json["content"].as_str()
         .ok_or_else(|| GithubError::InvalidResponse("Missing content field".to_string()))?;
-    
+
     if encoding == "base64" {
-        // Decode base64 content (remove newlines first)
         let cleaned_content = content.replace('\n', "").replace('\r', "");
         let decoded = STANDARD.decode(&cleaned_content)
             .map_err(|e| GithubError::InvalidResponse(format!("Failed to decode base64: {}", e)))?;
         String::from_utf8(decoded)
             .map_err(|e| GithubError::InvalidResponse(format!("Failed to convert to UTF-8: {}", e)))
     } else {
-        // Content is already text (shouldn't happen but handle it)
         Ok(content.to_string())
     }
 }
 
-pub async fn get_repo_languages(token: &str, owner: &str, repo: &str) -> Result<String, GithubError> {
-    let client = create_github_client()?;
+/// Language name -> bytes of code.
+pub async fn get_repo_languages(token: &str, owner: &str, repo: &str) -> Result<HashMap<String, u64>, GithubError> {
     let url = format!("https://api.github.com/repos/{}/{}/languages", owner, repo);
-    
-    let response = client.get(&url)
-        .header("User-Agent", "Galgo App")
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await
-        .map_err(GithubError::RequestError)?;
-    
-    let status = response.status().as_u16();
-    if !response.status().is_success() {
-        // Check for rate limit errors
-        if status == 403 || status == 429 {
-            let body = response.text().await.map_err(GithubError::RequestError)?;
-            let is_rate_limit = body.contains("API rate limit exceeded") 
-                || body.contains("rate limit")
-                || body.contains("X-RateLimit-Remaining")
-                || body.contains("rate limiting")
-                || status == 429;
-            
-            if is_rate_limit {
-                let error_msg = format!("GitHub API rate limit exceeded. Please wait before trying again.\nResponse: {}", body);
-                eprintln!("\n{}", "═".repeat(80).red());
-                eprintln!("{}", "  ⛔ RATE LIMIT EXCEEDED".bold().red());
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!("{}", error_msg);
-                eprintln!("{}", "═".repeat(80).red());
-                eprintln!();
-                return Err(GithubError::RateLimitExceeded(error_msg));
-            }
-        }
-        return Err(GithubError::InvalidResponse(format!("Failed to get file content: status {}", status)));
-    }
-    let body = response.text().await.map_err(GithubError::RequestError)?;
-    let json: Value = serde_json::from_str(&body)
-        .map_err(|e| GithubError::InvalidResponse(format!("Failed to parse JSON: {}", e)))?;
-    Ok(json.to_string())
+    let json = get_json(token, &url, None, "languages").await?;
+    serde_json::from_value(json).map_err(|e| GithubError::InvalidResponse(format!("Failed to parse languages: {}", e)))
 }

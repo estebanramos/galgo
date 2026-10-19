@@ -1,9 +1,10 @@
 use std::fmt;
+use std::io::IsTerminal;
 use clap::{CommandFactory, Parser};
 use colored::Colorize;
 use github::search;
 use token::get_token;
-use crate::github::{single_file_detection_with_regex, whole_repo_detection, list_repositories};
+use crate::github::{list_repositories, run_scan, ScanMode, ScanOptions};
 
 mod github;
 mod token;
@@ -16,6 +17,25 @@ struct Args {
 
     #[command(flatten)]
     analysis: AnalysisModes,
+
+    #[command(flatten)]
+    output: OutputConfig,
+}
+
+#[derive(Parser, Debug)]
+#[command(next_help_heading = "OUTPUT")]
+struct OutputConfig {
+    #[arg(long, num_args = 0..=1, value_name = "FILE", help = "Output results as JSON (stdout by default, or to FILE). Works in every mode")]
+    json: Option<Option<std::path::PathBuf>>,
+
+    #[arg(short, long, help = "Hide repositories with no secrets found (single-file and whole-repo modes)")]
+    quiet: bool,
+
+    #[arg(long, help = "Disable colored output (also disabled automatically when stdout is not a terminal)")]
+    no_color: bool,
+
+    #[arg(long, help = "Print full secret values instead of masked ones (e.g. AK****LE)")]
+    show_secrets: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -51,12 +71,6 @@ struct AnalysisModes {
 
     #[arg(long, value_delimiter(','), help = "Hide files with these extensions in list mode (e.g. .md,.html)")]
     exclude_ext: Option<Vec<String>>,
-
-    #[arg(long, num_args = 0..=1, value_name = "FILE", help = "In list mode: output as JSON (default: stdout)")]
-    json: Option<Option<std::path::PathBuf>>,
-
-    #[arg(short, long, help = "Hide repositories with no secrets found (single-file mode only)")]
-    quiet: bool,
 
     #[arg(long, value_parser = validate_max_files, help = "In whole-repo mode: maximum number of files to analyze per repository (default: unlimited)")]
     max_files: Option<usize>,
@@ -116,99 +130,68 @@ impl fmt::Display for GalgoError {
 }
 
 #[tokio::main]
-async fn main() -> () {
-    // Parse command-line arguments
+async fn main() {
     let args = Args::parse();
-    
-    if args.analysis.single_file {
-        match get_token() {
-            Ok(token) => {
-                println!("{} {}", "⏳ Processing:".green(), args.search.domain);
-                let result = search(&token, &args.search.domain, args.search.max_repos, args.analysis.include_ext.clone()).await;
-                match result {
-                    Ok((repos, error_counter)) => {
-                        single_file_detection_with_regex(repos, &token, error_counter, &args.search.sort, &args.search.commit_date, args.analysis.quiet).await;
-                    }
-                    Err(e) => {
-                        if let github::GithubError::RateLimitExceeded(_) = e {
-                            eprintln!("\n{}", "Execution stopped due to rate limit.".bold().red());
-                            std::process::exit(1);
-                        } else {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-            Err(e) => println!("Error: {}", e),
-        }
+
+    if args.output.no_color || !std::io::stdout().is_terminal() {
+        colored::control::set_override(false);
     }
-    else if args.analysis.whole_repo {
-        match get_token() {
-            Ok(token) => {
-                println!("{} {}", "⏳ Processing:".green(), args.search.domain);
-                let result = search(&token, &args.search.domain, args.search.max_repos, args.analysis.include_ext.clone()).await;
-                match result {
-                    Ok((repos, error_counter)) => {
-                        whole_repo_detection(repos, &token, &args.search.domain, error_counter, &args.search.sort, &args.search.commit_date, args.analysis.max_files, args.analysis.quiet).await;
-                    }
-                    Err(e) => {
-                        if let github::GithubError::RateLimitExceeded(_) = e {
-                            eprintln!("\n{}", "Execution stopped due to rate limit.".bold().red());
-                            std::process::exit(1);
-                        } else {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-            Err(e) => println!("Error: {}", e),
+
+    let mode = if args.analysis.single_file {
+        Some(ScanMode::SingleFile)
+    } else if args.analysis.whole_repo {
+        Some(ScanMode::WholeRepo)
+    } else if args.analysis.list {
+        None
+    } else {
+        eprintln!("❌ {}\n", GalgoError::NoModeSelected);
+        Args::command().print_help().unwrap();
+        std::process::exit(2);
+    };
+
+    let token = get_token().unwrap_or_else(|e| {
+        eprintln!("{}", e);
+        std::process::exit(2);
+    });
+    eprintln!("{} {}", "⏳ Processing:".green(), args.search.domain);
+    let (repos, error_counter) = match search(&token, &args.search.domain, args.search.max_repos, args.analysis.include_ext.clone()).await {
+        Ok(r) => r,
+        Err(github::GithubError::RateLimitExceeded(msg)) => {
+            eprintln!("\n{}\n{}", "⛔ Execution stopped due to rate limit.".bold().red(), msg);
+            std::process::exit(2);
         }
-    }
-    else if args.analysis.list {
-        match get_token() {
-            Ok(token) => {
-                println!("{} {}", "⏳ Processing:".green(), args.search.domain);
-                let result = search(&token, &args.search.domain, args.search.max_repos, args.analysis.include_ext.clone()).await;
-                match result {
-                    Ok((repos, error_counter)) => {
-                        list_repositories(
-                            repos,
-                            error_counter,
-                            &args.search.sort,
-                            &args.search.commit_date,
-                            args.analysis.include_ext.clone(),
-                            args.analysis.exclude_ext.clone(),
-                            args.analysis.json.clone(),
-                        ).await;
-                    }
-                    Err(e) => {
-                        if let github::GithubError::RateLimitExceeded(_) = e {
-                            eprintln!("\n{}", "Execution stopped due to rate limit.".bold().red());
-                            std::process::exit(1);
-                        } else {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
-                }
-            }
-            Err(e) => println!("Error: {}", e),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(2);
         }
-    }
-    else {
-        let mut cmd = Args::command();
-        eprintln!("❌ {}", GalgoError::NoModeSelected);
-        eprintln!("\n{}", "For more information:".yellow());
-        cmd.print_help().unwrap();
+    };
+
+    let Some(mode) = mode else {
+        list_repositories(
+            repos,
+            error_counter,
+            &args.search.sort,
+            &args.search.commit_date,
+            args.analysis.include_ext,
+            args.analysis.exclude_ext,
+            args.output.json,
+        ).await;
+        return;
+    };
+
+    let findings = run_scan(repos, &token, error_counter, ScanOptions {
+        mode,
+        domain: args.search.domain,
+        sort_order: args.search.sort,
+        commit_date_kind: args.search.commit_date,
+        max_files: args.analysis.max_files,
+        quiet: args.output.quiet,
+        show_secrets: args.output.show_secrets,
+        json: args.output.json,
+    }).await;
+
+    // Exit codes: 0 = clean, 1 = secrets found, 2 = usage/auth/API error.
+    if findings > 0 {
         std::process::exit(1);
     }
-    
 }
-
-
-
-
-
-
