@@ -162,6 +162,19 @@ Previously a missing token printed an error and exited `0`.
 - JSON gains `stars`, `forks`, `license`, `is_fork`, `archived`, `pushed_at`
   and `files[] {path, status, findings}` (single-file mode).
 
+### Usability pass (fourth pass)
+- **Skip filter matches whole words.** `should_scan_repository` used substring
+  matching, so `penetration-testing` hit `test`, `springdoc-openapi` hit `doc`
+  and `gpstest` hit `test`, silently dropping valid repos. Names, descriptions,
+  topics and the owner/domain check now compare whole words. `testing` was
+  removed from the skip list (it matched security-testing repos).
+- **Findings first in the repo box.** Order is now: findings, then Stats /
+  Languages / Scanned / Last commit. Branch, description, topics, last push and
+  matched files only with `-v`. Each finding takes two lines so the full path
+  fits.
+- **No duplicated findings list.** The end summary now appears only when two or
+  more repos have findings, as one line per repo with counts per severity.
+
 ## 5. Token handling and rotation
 
 ### Sources

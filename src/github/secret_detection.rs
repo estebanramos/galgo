@@ -690,7 +690,7 @@ fn compact_count(n: u64) -> String {
     if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
 }
 
-fn print_report(r: &RepoReport, index: usize, total: usize, w: usize) {
+fn print_report(r: &RepoReport, index: usize, total: usize, w: usize, verbose: bool) {
     let row = |label: &str, value: &str| println!("{}", create_box_row(label, value, w - 2));
     let sep = || println!("{}", create_box_separator(w));
 
@@ -708,9 +708,30 @@ fn print_report(r: &RepoReport, index: usize, total: usize, w: usize) {
         return;
     }
 
-    if let Some(b) = &r.branch { row("🌿 Branch", b); }
-    if let Some(d) = &r.description { row("📝 Description", d); }
-    if !r.topics.is_empty() { row("🏷️  Topics", &r.topics.join(", ")); }
+    // What matters first: the findings.
+    if r.findings.is_empty() {
+        row("✅ Status", "No secrets detected");
+    } else {
+        row("🚨 Secrets Found", &format!("{} potential secret(s)", r.findings.len()));
+        for f in &r.findings {
+            let what = if f.variable != "unknown" { format!("{}: {}", f.variable.bold().cyan(), f.secret_type) } else { f.secret_type.clone() };
+            println!("│  [{}] {}:{}", f.severity.label(), link(&middle(&f.file, w.saturating_sub(18).max(20)), &f.url).bold().yellow(), f.line);
+            println!("│         {}  {}", what, f.value.dimmed());
+        }
+    }
+    if !r.env_references.is_empty() {
+        row("ℹ️  Env-based", &format!("{} line(s) read env vars (not reported)", r.env_references.len()));
+    }
+    sep();
+
+    // Context: a few rows by default, everything with -v.
+    if let (Some(st), Some(fk)) = (r.stars, r.forks) {
+        let mut tags = vec![format!("★ {}", compact_count(st)), format!("⑂ {}", compact_count(fk))];
+        if let Some(l) = &r.license { tags.push(l.clone()); }
+        if r.is_fork { tags.push("fork".into()); }
+        if r.archived { tags.push("archived".into()); }
+        row("⭐ Stats", &tags.join(" · "));
+    }
     if !r.languages.is_empty() {
         let (shown, other): (Vec<_>, Vec<_>) = r.languages.iter().partition(|(_, p)| *p > 1.0);
         let mut parts: Vec<String> = shown.iter().map(|(l, p)| format!("{} {}", l.bold().cyan(), format!("{p:.1}%").yellow())).collect();
@@ -719,46 +740,27 @@ fn print_report(r: &RepoReport, index: usize, total: usize, w: usize) {
         }
         row("🌐 Languages", &parts.join(" · "));
     }
-    if let (Some(st), Some(fk)) = (r.stars, r.forks) {
-        let mut tags = vec![format!("★ {}", compact_count(st)), format!("⑂ {}", compact_count(fk))];
-        if let Some(l) = &r.license { tags.push(l.clone()); }
-        if r.is_fork { tags.push("fork".into()); }
-        if r.archived { tags.push("archived".into()); }
-        row("⭐ Stats", &tags.join(" · "));
-    }
-    if let Some(p) = &r.pushed_at { row("🕒 Last push", p.trim_end_matches('Z').replace('T', " ").as_str()); }
-    sep();
-    if r.files.is_empty() {
-        if !r.matched_files.is_empty() { row("📝 Files", &r.matched_files.join(", ")); }
-    } else {
-        for f in &r.files {
-            println!("│ 📝 Matched file: {}  [{}]", link(&f.path, &f.url), file_label(f));
-        }
-    }
     row("📊 Scanned", &format!("{} file(s)", r.files_scanned));
     if let Some(note) = &r.note { row("ℹ️  Note", note); }
-    if let (Some(f), Some(c)) = (r.last_commit_file, r.last_commit_repo) {
-        row("📆 Last commit (file)", &f.format("%d/%m/%Y %H:%M:%S UTC").to_string());
-        row("📆 Last commit (repo)", &c.format("%d/%m/%Y %H:%M:%S UTC").to_string());
-    }
-    sep();
+    if let Some(c) = r.last_commit_repo { row("📆 Last commit", &c.format("%d/%m/%Y %H:%M UTC").to_string()); }
 
-    if r.findings.is_empty() {
-        row("✅ Status", "No secrets detected");
-    } else {
-        row("🚨 Secrets Found", &format!("{} potential secret(s)", r.findings.len()));
-        for f in &r.findings {
-            let what = if f.variable != "unknown" { format!("{}: {}", f.variable.bold().cyan(), f.secret_type) } else { f.secret_type.clone() };
-            println!("│   [{}] {}:{} ({}) {}", f.severity.label(), link(&middle(&f.file, w.saturating_sub(40).max(20)), &f.url).bold().yellow(), f.line, what, f.value.dimmed());
+    if verbose {
+        sep();
+        if let Some(b) = &r.branch { row("🌿 Branch", b); }
+        if let Some(d) = &r.description { row("📝 Description", d); }
+        if !r.topics.is_empty() { row("🏷️  Topics", &r.topics.join(", ")); }
+        if let Some(p) = &r.pushed_at { row("🕒 Last push", p.trim_end_matches('Z').replace('T', " ").as_str()); }
+        if let Some(f) = r.last_commit_file { row("📆 Matched file changed", &f.format("%d/%m/%Y %H:%M UTC").to_string()); }
+        if r.files.is_empty() {
+            if !r.matched_files.is_empty() { row("📝 Files", &r.matched_files.join(", ")); }
+        } else {
+            for f in &r.files {
+                println!("│ 📝 Matched file: {}  [{}]", link(&f.path, &f.url), file_label(f));
+            }
         }
-    }
-    if !r.env_references.is_empty() {
-        sep();
-        row("ℹ️  Env-based", &format!("{} line(s) read env vars (not reported)", r.env_references.len()));
-    }
-    if r.skipped_files > 0 {
-        sep();
-        row("⏭️  Skipped", &format!("{} file(s) skipped ({})", r.skipped_files, r.skipped_extensions.join(", ")));
+        if r.skipped_files > 0 {
+            row("⏭️  Skipped", &format!("{} file(s) skipped ({})", r.skipped_files, r.skipped_extensions.join(", ")));
+        }
     }
     println!("{}\n", create_box_footer(w));
 }
@@ -823,7 +825,7 @@ pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, er
         if human && !hidden {
             mp.suspend(|| {
                 if opts.verbose || !report.findings.is_empty() {
-                    print_report(&report, i + 1, total, w);
+                    print_report(&report, i + 1, total, w, opts.verbose);
                 } else {
                     print_line(&report);
                 }
@@ -853,19 +855,23 @@ pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, er
     findings
 }
 
-/// All findings across repositories, highest severity first: what the reader should look at.
+/// Per-repo ranking for runs where findings are spread over several repositories (the boxes have scrolled by).
+/// With a single affected repo its box already says everything, so nothing is printed.
 fn print_findings_summary(reports: &[RepoReport], w: usize) {
-    let mut all: Vec<(&RepoReport, &Finding)> = reports.iter().flat_map(|r| r.findings.iter().map(move |f| (r, f))).collect();
-    if all.is_empty() {
+    let mut hit: Vec<&RepoReport> = reports.iter().filter(|r| !r.findings.is_empty()).collect();
+    if hit.len() < 2 {
         return;
     }
-    all.sort_by(|a, b| b.1.severity.cmp(&a.1.severity));
+    let top = |r: &RepoReport| r.findings.iter().map(|f| f.severity).max();
+    hit.sort_by(|a, b| top(b).cmp(&top(a)).then(b.findings.len().cmp(&a.findings.len())));
     println!("{}", "═".repeat(w).cyan());
-    println!("{}", format!("  🚨 {} finding(s), highest severity first", all.len()).bold().red());
+    println!("{}", format!("  🚨 {} finding(s) in {} repositories, highest severity first", hit.iter().map(|r| r.findings.len()).sum::<usize>(), hit.len()).bold().red());
     println!("{}", "═".repeat(w).cyan());
-    for (r, f) in all {
-        println!("[{:^6}] {}  {}", f.severity.label(), link(short_name(&r.repository), &r.repository).bold(), link(&format!("{}:{}", middle(&f.file, w.saturating_sub(45).max(20)), f.line), &f.url).yellow());
-        println!("         {} {}", f.secret_type, f.value.dimmed());
+    for r in hit {
+        let count = |sev| r.findings.iter().filter(|f| f.severity == sev).count();
+        let counts: Vec<String> = [(Severity::High, "high"), (Severity::Medium, "medium"), (Severity::Low, "low")].iter()
+            .filter(|(s, _)| count(*s) > 0).map(|(s, n)| format!("{} {}", count(*s), n)).collect();
+        println!("[{:^6}] {}  {}", top(r).map(|s| s.label()).unwrap_or_default(), link(short_name(&r.repository), &r.repository).bold(), counts.join(" · ").dimmed());
     }
     println!();
 }
@@ -1036,7 +1042,7 @@ mod tests {
         print_line(&clean);
         print_line(&skipped);
         print_line(&failed);
-        print_report(&hit, 4, 4, w);
+        print_report(&hit, 4, 4, w, false);
         print_findings_summary(&[hit, clean], w);
     }
 }

@@ -582,15 +582,18 @@ pub fn should_scan_repository(metadata: &RepoMetadata, domain: &str) -> (bool, O
         "report", "reports", "analysis", "analyses",
         "wiki", "guide", "guides", "tutorial", "tutorials",
         "example", "examples", "demo", "demos", "sample", "samples",
-        "test", "tests", "testing", "spec", "specs",
+        "test", "tests", "spec", "specs",
         "archive", "archived", "backup", "backups",
         "old", "legacy", "deprecated", "obsolete",
         "random", "misc", "miscellaneous", "temp", "tmp",
     ];
     
+    // Whole words only: "gpstest" or "springdoc-openapi" must not match "test" / "doc".
+    let has_word = |text: &str, w: &str| text.split(|c: char| !c.is_alphanumeric()).any(|t| t == w);
+
     // Check repository name patterns
     for pattern in &skip_patterns {
-        if repo_name_lower.contains(pattern) {
+        if has_word(&repo_name_lower, pattern) {
             return (false, Some(format!("Repository name contains '{}' (likely documentation/report/analysis repo)", pattern)));
         }
     }
@@ -611,7 +614,7 @@ pub fn should_scan_repository(metadata: &RepoMetadata, domain: &str) -> (bool, O
     
     // Check if owner matches domain (e.g., owner "example" matches domain "example.com")
     let domain_without_tld = clean_domain.split('.').next().unwrap_or(&clean_domain);
-    if owner_lower == domain_without_tld || owner_lower.contains(domain_without_tld) {
+    if has_word(&owner_lower, domain_without_tld) {
         return (false, Some(format!("Repository owner '{}' matches domain '{}' (likely same company)", owner_lower, domain)));
     }
     
@@ -619,7 +622,7 @@ pub fn should_scan_repository(metadata: &RepoMetadata, domain: &str) -> (bool, O
     if let Some(ref desc) = metadata.description {
         let desc_lower = desc.to_lowercase();
         for pattern in &skip_patterns {
-            if desc_lower.contains(pattern) {
+            if has_word(&desc_lower, pattern) {
                 return (false, Some(format!("Repository description contains '{}' (likely documentation/report/analysis repo)", pattern)));
             }
         }
@@ -627,7 +630,7 @@ pub fn should_scan_repository(metadata: &RepoMetadata, domain: &str) -> (bool, O
         // Check for documentation indicators in description
         let doc_indicators = ["documentation", "docs", "guide", "tutorial", "wiki", "example", "demo"];
         for indicator in &doc_indicators {
-            if desc_lower.contains(indicator) {
+            if has_word(&desc_lower, indicator) {
                 return (false, Some(format!("Repository description indicates it's a {} repository", indicator)));
             }
         }
@@ -637,7 +640,7 @@ pub fn should_scan_repository(metadata: &RepoMetadata, domain: &str) -> (bool, O
     for topic in &metadata.topics {
         let topic_lower = topic.to_lowercase();
         for pattern in &skip_patterns {
-            if topic_lower.contains(pattern) {
+            if has_word(&topic_lower, pattern) {
                 return (false, Some(format!("Repository topic '{}' indicates it's a {} repository", topic, pattern)));
             }
         }
@@ -699,4 +702,24 @@ pub async fn get_repo_languages(token: &TokenPool, owner: &str, repo: &str) -> R
     let url = format!("https://api.github.com/repos/{}/{}/languages", owner, repo);
     let json = get_json(token, &url, None, "languages").await?;
     serde_json::from_value(json).map_err(|e| GithubError::InvalidResponse(format!("Failed to parse languages: {}", e)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(name: &str, topics: &[&str]) -> RepoMetadata {
+        RepoMetadata {
+            default_branch: "main".into(), description: None, topics: topics.iter().map(|t| t.to_string()).collect(),
+            owner: "someone".into(), name: name.into(), is_archived: false,
+            stars: 0, forks: 0, license: None, is_fork: false, pushed_at: None,
+        }
+    }
+
+    #[test]
+    fn skip_filter_matches_whole_words_only() {
+        assert!(should_scan_repository(&meta("gpstest", &["penetration-testing", "springdoc-openapi"]), "example.com").0);
+        assert!(!should_scan_repository(&meta("my-docs", &[]), "example.com").0);
+        assert!(!should_scan_repository(&meta("app", &["unit-test"]), "example.com").0);
+    }
 }
