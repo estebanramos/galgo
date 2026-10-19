@@ -394,9 +394,37 @@ pub struct RepoReport {
     pub last_commit_repo: Option<chrono::DateTime<chrono::Utc>>,
     pub findings: Vec<Finding>,
     pub env_references: Vec<EnvReference>,
+    pub stars: Option<u64>,
+    pub forks: Option<u64>,
+    pub license: Option<String>,
+    pub is_fork: bool,
+    pub archived: bool,
+    pub pushed_at: Option<String>,
+    /// Single-file mode: what happened to each file the search matched.
+    pub files: Vec<FileEntry>,
+}
+
+#[derive(Serialize)]
+pub struct FileEntry {
+    pub path: String,
+    /// "scanned", "skipped" (ignored extension) or "failed" (could not be fetched)
+    pub status: &'static str,
+    pub findings: usize,
 }
 
 impl RepoReport {
+    fn apply_meta(&mut self, m: super::github::RepoMetadata) {
+        self.branch = Some(m.default_branch);
+        self.description = m.description.filter(|d| !d.is_empty());
+        self.topics = m.topics;
+        self.stars = Some(m.stars);
+        self.forks = Some(m.forks);
+        self.license = m.license.filter(|l| l != "NOASSERTION");
+        self.is_fork = m.is_fork;
+        self.archived = m.is_archived;
+        self.pushed_at = m.pushed_at;
+    }
+
     fn new(repo: &Repository) -> Self {
         RepoReport {
             repository: repo.repository_url.clone(),
@@ -514,10 +542,16 @@ async fn scan_single(repo: &Repository, token: &TokenPool, counter: &super::gith
     let (files, meta) = tokio::join!(files, meta);
 
     if let Some((m, l)) = meta {
-        report.branch = m.map(|m| m.default_branch);
+        if let Some(m) = m { report.apply_meta(m); }
         report.languages = l.map(language_shares).unwrap_or_default();
     }
     for (path, outcome) in files {
+        let (status, findings) = match &outcome {
+            FileOutcome::Scanned(o) => ("scanned", o.findings.len()),
+            FileOutcome::Skipped => ("skipped", 0),
+            FileOutcome::Failed => ("failed", 0),
+        };
+        report.files.push(FileEntry { path: path.clone(), status, findings });
         report.merge(&path, outcome);
     }
     report.sort_findings();
@@ -546,9 +580,7 @@ async fn scan_whole(repo: &Repository, token: &TokenPool, domain: &str, counter:
         return report.fail("skipped", reason.unwrap_or_else(|| "Repository filtered out".to_string()));
     }
     let mut report = report;
-    report.branch = Some(metadata.default_branch.clone());
-    report.description = metadata.description.filter(|d| !d.is_empty());
-    report.topics = metadata.topics;
+    report.apply_meta(metadata.clone());
 
     let all_files = match get_repo_files_recursive(token, &owner, &name, &metadata.default_branch).await {
         Ok(files) => files,
@@ -616,8 +648,36 @@ fn print_line(r: &RepoReport) {
     match r.status {
         "skipped" => println!("{} {}  {}", "⏭ ".dimmed(), short_name(&r.repository).dimmed(), r.note.as_deref().unwrap_or("").dimmed()),
         "error" => println!("{} {}  {}", "✗".red().bold(), short_name(&r.repository), r.note.as_deref().unwrap_or("").red()),
-        _ => println!("{} {}  {}", "✓".green(), short_name(&r.repository), format!("{} file(s) scanned, no secrets", r.files_scanned).dimmed()),
+        _ => {
+            let stars = r.stars.map(|s| format!("★ {}  ", compact_count(s))).unwrap_or_default();
+            println!("{} {}  {}{}", "✓".green(), short_name(&r.repository), stars.yellow(), format!("{} file(s) scanned, no secrets", r.files_scanned).dimmed());
+            print_files(r);
+        }
     }
+}
+
+fn file_label(f: &FileEntry) -> String {
+    match f.status {
+        "skipped" => "skipped (extension ignored)".to_string(),
+        "failed" => "could not be fetched".to_string(),
+        _ if f.findings > 0 => format!("{} finding(s)", f.findings),
+        _ => "clean".to_string(),
+    }
+}
+
+/// Which files matched the domain and what became of each (single-file mode).
+fn print_files(r: &RepoReport) {
+    const SHOWN: usize = 5;
+    for f in r.files.iter().take(SHOWN) {
+        println!("    {} {}  {}", "↳".dimmed(), f.path, file_label(f).dimmed());
+    }
+    if r.files.len() > SHOWN {
+        println!("    {}", format!("… +{} more matching file(s)", r.files.len() - SHOWN).dimmed());
+    }
+}
+
+fn compact_count(n: u64) -> String {
+    if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
 }
 
 fn print_report(r: &RepoReport, index: usize, total: usize, w: usize) {
@@ -649,8 +709,22 @@ fn print_report(r: &RepoReport, index: usize, total: usize, w: usize) {
         }
         row("🌐 Languages", &parts.join(" · "));
     }
+    if let (Some(st), Some(fk)) = (r.stars, r.forks) {
+        let mut tags = vec![format!("★ {}", compact_count(st)), format!("⑂ {}", compact_count(fk))];
+        if let Some(l) = &r.license { tags.push(l.clone()); }
+        if r.is_fork { tags.push("fork".into()); }
+        if r.archived { tags.push("archived".into()); }
+        row("⭐ Stats", &tags.join(" · "));
+    }
+    if let Some(p) = &r.pushed_at { row("🕒 Last push", p.trim_end_matches('Z').replace('T', " ").as_str()); }
     sep();
-    if !r.matched_files.is_empty() { row("📝 Files", &r.matched_files.join(", ")); }
+    if r.files.is_empty() {
+        if !r.matched_files.is_empty() { row("📝 Files", &r.matched_files.join(", ")); }
+    } else {
+        for f in &r.files {
+            row("📝 Matched file", &format!("{}  [{}]", f.path, file_label(f)));
+        }
+    }
     row("📊 Scanned", &format!("{} file(s)", r.files_scanned));
     if let Some(note) = &r.note { row("ℹ️  Note", note); }
     if let (Some(f), Some(c)) = (r.last_commit_file, r.last_commit_repo) {

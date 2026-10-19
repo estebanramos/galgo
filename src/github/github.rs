@@ -532,6 +532,11 @@ pub struct RepoMetadata {
     pub owner: String,
     pub name: String,
     pub is_archived: bool,
+    pub stars: u64,
+    pub forks: u64,
+    pub license: Option<String>,
+    pub is_fork: bool,
+    pub pushed_at: Option<String>,
 }
 
 /// Get repository metadata (branch, description, topics, etc.) in a single request
@@ -556,6 +561,11 @@ pub async fn get_repo_metadata(token: &TokenPool, owner: &str, repo: &str) -> Re
         owner: owner.to_string(),
         name: repo.to_string(),
         is_archived: json["archived"].as_bool().unwrap_or(false),
+        stars: json["stargazers_count"].as_u64().unwrap_or(0),
+        forks: json["forks_count"].as_u64().unwrap_or(0),
+        license: json["license"]["spdx_id"].as_str().map(String::from),
+        is_fork: json["fork"].as_bool().unwrap_or(false),
+        pushed_at: json["pushed_at"].as_str().map(String::from),
     })
 }
 

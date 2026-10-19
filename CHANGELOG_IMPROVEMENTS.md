@@ -154,6 +154,14 @@ Previously a missing token printed an error and exited `0`.
 
 ---
 
+### Matched files and repo details (third pass)
+- Single-file mode lists, under each repo line, which matched file was scanned,
+  skipped (ignored extension, e.g. `.md`) or could not be fetched.
+- Repo lines show stars; `-v` boxes add stars, forks, license, fork/archived
+  flags, last push, and one row per matched file with its outcome.
+- JSON gains `stars`, `forks`, `license`, `is_fork`, `archived`, `pushed_at`
+  and `files[] {path, status, findings}` (single-file mode).
+
 ## 5. Token handling and rotation
 
 ### Sources
