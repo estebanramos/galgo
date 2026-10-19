@@ -31,6 +31,9 @@ struct OutputConfig {
     #[arg(short, long, help = "Hide repositories with no secrets found (single-file and whole-repo modes)")]
     quiet: bool,
 
+    #[arg(short, long, help = "Print a full box for every repository (default: only repositories with findings; clean ones take one line)")]
+    verbose: bool,
+
     #[arg(long, help = "Disable colored output (also disabled automatically when stdout is not a terminal)")]
     no_color: bool,
 
@@ -186,6 +189,7 @@ async fn main() {
         commit_date_kind: args.search.commit_date,
         max_files: args.analysis.max_files,
         quiet: args.output.quiet,
+        verbose: args.output.verbose,
         show_secrets: args.output.show_secrets,
         json: args.output.json,
     }).await;

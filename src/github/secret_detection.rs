@@ -524,7 +524,7 @@ async fn scan_single(repo: &Repository, token: &str, counter: &super::github::Ht
 }
 
 /// Whole-repo mode: fetch the file tree and scan the config-like files.
-async fn scan_whole(repo: &Repository, token: &str, domain: &str, counter: &super::github::HttpErrorCounter, max_files: Option<usize>, reveal: bool) -> RepoReport {
+async fn scan_whole(repo: &Repository, token: &str, domain: &str, counter: &super::github::HttpErrorCounter, max_files: Option<usize>, reveal: bool, mp: &indicatif::MultiProgress) -> RepoReport {
     use super::github::{extract_repo_info, get_repo_metadata, should_scan_repository, get_repo_files_recursive, get_file_content_by_sha};
     use indicatif::{ProgressBar, ProgressStyle};
     const MAX_CONCURRENT_FILE_REQUESTS: usize = 40;
@@ -568,13 +568,12 @@ async fn scan_whole(repo: &Repository, token: &str, domain: &str, counter: &supe
         report.note = Some(format!("--max-files applied: {} of {} interesting files scanned", files.len(), total_interesting));
     }
 
-    let pb = ProgressBar::new(files.len() as u64);
+    let pb = mp.add(ProgressBar::new(files.len() as u64));
     pb.set_style(ProgressStyle::default_bar()
-        .template("{spinner:.magenta} [{elapsed_precise}] [{bar:20.magenta/blue}] {pos:>5}/{len:5} ({percent:>3}%) {msg:.dim}")
+        .template("  {spinner:.magenta} [{bar:20.magenta/blue}] {pos}/{len} files {msg:.dim}")
         .unwrap()
         .progress_chars("█▉▊▋▌▍▎▏░"));
-    pb.set_message(format!("Scanning {}/{}", owner, name));
-    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+        pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     let semaphore = tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_REQUESTS);
     let results = futures::future::join_all(files.iter().map(|(path, sha)| {
@@ -590,13 +589,41 @@ async fn scan_whole(repo: &Repository, token: &str, domain: &str, counter: &supe
     report
 }
 
-const BOX_WIDTH: usize = 80;
+/// Terminal width clamped to a readable range (80 when stdout is not a terminal).
+fn box_width() -> usize {
+    let term = console::Term::stdout();
+    if term.is_term() { (term.size().1 as usize).clamp(60, 110) } else { 80 }
+}
 
-fn print_report(r: &RepoReport, index: usize, total: usize) {
-    let row = |label: &str, value: &str| println!("{}", create_box_row(label, value, BOX_WIDTH - 2));
-    let sep = || println!("{}", create_box_separator(BOX_WIDTH));
+/// Shorten `s` to `max` chars by cutting the middle, keeping both ends (file names matter).
+fn middle(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max < 8 {
+        return s.to_string();
+    }
+    let keep = max - 1;
+    let tail = keep / 2;
+    format!("{}…{}", chars[..keep - tail].iter().collect::<String>(), chars[chars.len() - tail..].iter().collect::<String>())
+}
 
-    println!("{}", create_box_header("Repository", index, total, BOX_WIDTH).cyan().bold());
+fn short_name(url: &str) -> &str {
+    url.trim_start_matches("https://github.com/")
+}
+
+/// One-line result for repos that do not deserve a box.
+fn print_line(r: &RepoReport) {
+    match r.status {
+        "skipped" => println!("{} {}  {}", "⏭ ".dimmed(), short_name(&r.repository).dimmed(), r.note.as_deref().unwrap_or("").dimmed()),
+        "error" => println!("{} {}  {}", "✗".red().bold(), short_name(&r.repository), r.note.as_deref().unwrap_or("").red()),
+        _ => println!("{} {}  {}", "✓".green(), short_name(&r.repository), format!("{} file(s) scanned, no secrets", r.files_scanned).dimmed()),
+    }
+}
+
+fn print_report(r: &RepoReport, index: usize, total: usize, w: usize) {
+    let row = |label: &str, value: &str| println!("{}", create_box_row(label, value, w - 2));
+    let sep = || println!("{}", create_box_separator(w));
+
+    println!("{}", create_box_header("Repository", index, total, w).cyan().bold());
     row("🔗 URL", &r.repository);
     sep();
 
@@ -606,7 +633,7 @@ fn print_report(r: &RepoReport, index: usize, total: usize) {
         _ => {}
     }
     if r.status != "scanned" {
-        println!("{}\n", create_box_footer(BOX_WIDTH));
+        println!("{}\n", create_box_footer(w));
         return;
     }
 
@@ -615,11 +642,11 @@ fn print_report(r: &RepoReport, index: usize, total: usize) {
     if !r.topics.is_empty() { row("🏷️  Topics", &r.topics.join(", ")); }
     if !r.languages.is_empty() {
         let (shown, other): (Vec<_>, Vec<_>) = r.languages.iter().partition(|(_, p)| *p > 1.0);
-        let mut parts: Vec<String> = shown.iter().map(|(l, p)| format!("• {}: {}", l.bold().cyan(), format!("{p:.2}%").yellow())).collect();
+        let mut parts: Vec<String> = shown.iter().map(|(l, p)| format!("{} {}", l.bold().cyan(), format!("{p:.1}%").yellow())).collect();
         if !other.is_empty() {
-            parts.push(format!("{}: {}", "Other".bold().cyan(), format!("{:.2}%", other.iter().map(|(_, p)| p).sum::<f64>()).yellow()));
+            parts.push(format!("{} {}", "Other".bold().cyan(), format!("{:.1}%", other.iter().map(|(_, p)| p).sum::<f64>()).yellow()));
         }
-        row("🌐 Languages", &parts.join("\n"));
+        row("🌐 Languages", &parts.join(" · "));
     }
     sep();
     if !r.matched_files.is_empty() { row("📝 Files", &r.matched_files.join(", ")); }
@@ -631,27 +658,24 @@ fn print_report(r: &RepoReport, index: usize, total: usize) {
     }
     sep();
 
-    if !r.env_references.is_empty() {
-        row("ℹ️  Env-based", &format!("{} match(es) read from the environment (not reported)", r.env_references.len()));
-        for e in &r.env_references {
-            println!("│   {} {}:{} {}", "ℹ️".yellow(), e.file.bold().yellow(), e.line, format!("({})", e.text).dimmed());
-        }
-        sep();
-    }
     if r.findings.is_empty() {
         row("✅ Status", "No secrets detected");
     } else {
         row("🚨 Secrets Found", &format!("{} potential secret(s)", r.findings.len()));
         for f in &r.findings {
             let what = if f.variable != "unknown" { format!("{}: {}", f.variable.bold().cyan(), f.secret_type) } else { f.secret_type.clone() };
-            println!("│   [{}] {}:{} ({}) {}", f.severity.label(), f.file.bold().yellow(), f.line, what, f.value.dimmed());
+            println!("│   [{}] {}:{} ({}) {}", f.severity.label(), middle(&f.file, w.saturating_sub(40).max(20)).bold().yellow(), f.line, what, f.value.dimmed());
         }
+    }
+    if !r.env_references.is_empty() {
+        sep();
+        row("ℹ️  Env-based", &format!("{} line(s) read env vars (not reported)", r.env_references.len()));
     }
     if r.skipped_files > 0 {
         sep();
         row("⏭️  Skipped", &format!("{} file(s) skipped ({})", r.skipped_files, r.skipped_extensions.join(", ")));
     }
-    println!("{}\n", create_box_footer(BOX_WIDTH));
+    println!("{}\n", create_box_footer(w));
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -667,6 +691,8 @@ pub struct ScanOptions {
     pub commit_date_kind: String,
     pub max_files: Option<usize>,
     pub quiet: bool,
+    /// Print a full box for every repository, even clean ones.
+    pub verbose: bool,
     pub show_secrets: bool,
     /// `Some(None)` = JSON to stdout, `Some(Some(path))` = JSON to file.
     pub json: Option<Option<std::path::PathBuf>>,
@@ -682,39 +708,81 @@ pub async fn run_scan(result: HashMap<String, Repository>, token: &str, error_co
         _ => repos.sort_by_key(|r| std::cmp::Reverse(key(r))),
     }
 
+    use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
     let total = repos.len();
-    let title = if opts.mode == ScanMode::SingleFile { "Analyzing repositories for secrets" } else { "Whole repository analysis (config-like files, not filtered by domain)" };
-    eprintln!("\n{}", "─".repeat(BOX_WIDTH).cyan());
-    eprintln!("{}", format!("  🔍 {} - {} repositories", title, total).bold().cyan());
-    eprintln!("{}", format!("  📊 Sorted by {} commit date: {}", opts.commit_date_kind, if opts.sort_order == "asc" { "oldest first" } else { "newest first" }).bold().cyan());
-    eprintln!("{}\n", "─".repeat(BOX_WIDTH).cyan());
+    let w = box_width();
+    let mode_name = if opts.mode == ScanMode::SingleFile { "single-file" } else { "whole-repo" };
+    eprintln!("{}", format!("🔍 Scanning {} repositories ({}), {} commit date {}",
+        total, mode_name, opts.commit_date_kind, if opts.sort_order == "asc" { "oldest first" } else { "newest first" }).bold().cyan());
+
+    // One live status line at the bottom; finished repos are printed above it.
+    let mp = MultiProgress::new();
+    let status = mp.add(ProgressBar::new(total as u64));
+    status.set_style(ProgressStyle::default_bar()
+        .template("{spinner:.cyan} [{pos}/{len}] {msg}")
+        .unwrap());
+    status.enable_steady_tick(std::time::Duration::from_millis(100));
+    let human = opts.json.is_none();
 
     let mut reports: Vec<RepoReport> = Vec::new();
+    let mut findings_so_far = 0;
     for (i, repo) in repos.iter().enumerate() {
+        status.set_message(format!("{}  {}", short_name(&repo.repository_url).bold(), format!("{} finding(s) so far", findings_so_far).dimmed()));
         let report = match opts.mode {
             ScanMode::SingleFile => scan_single(repo, token, &error_counter, opts.show_secrets).await,
-            ScanMode::WholeRepo => scan_whole(repo, token, &opts.domain, &error_counter, opts.max_files, opts.show_secrets).await,
+            ScanMode::WholeRepo => scan_whole(repo, token, &opts.domain, &error_counter, opts.max_files, opts.show_secrets, &mp).await,
         };
-        if opts.quiet && report.findings.is_empty() {
-            continue;
+        status.inc(1);
+        findings_so_far += report.findings.len();
+        let hidden = opts.quiet && report.findings.is_empty() && report.status != "error";
+        if human && !hidden {
+            mp.suspend(|| {
+                if opts.verbose || !report.findings.is_empty() {
+                    print_report(&report, i + 1, total, w);
+                } else {
+                    print_line(&report);
+                }
+            });
         }
-        if opts.json.is_none() {
-            print_report(&report, i + 1, total);
+        if !hidden {
+            reports.push(report);
         }
-        reports.push(report);
     }
+    status.finish_and_clear();
 
     if let Some(dest) = &opts.json {
         write_json(&reports, dest.as_deref());
     }
 
     let findings: usize = reports.iter().map(|r| r.findings.len()).sum();
+    if human {
+        print_findings_summary(&reports, w);
+    }
     let with_findings = reports.iter().filter(|r| !r.findings.is_empty()).count();
-    eprintln!("{}", "═".repeat(BOX_WIDTH).cyan());
-    eprintln!("{}", format!("  ✨ Done: {} repositories scanned, {} with findings, {} finding(s) total", total, with_findings, findings).bold().green());
-    eprintln!("{}\n", "═".repeat(BOX_WIDTH).cyan());
+    let errors = reports.iter().filter(|r| r.status == "error").count();
+    let skipped = reports.iter().filter(|r| r.status == "skipped").count();
+    let summary = format!("✨ {} repositories: {} with findings ({} total), {} skipped, {} errors",
+        total, with_findings, findings, skipped, errors);
+    eprintln!("{}", if findings > 0 { summary.bold().red() } else { summary.bold().green() });
     error_counter.print_summary();
     findings
+}
+
+/// All findings across repositories, highest severity first: what the reader should look at.
+fn print_findings_summary(reports: &[RepoReport], w: usize) {
+    let mut all: Vec<(&RepoReport, &Finding)> = reports.iter().flat_map(|r| r.findings.iter().map(move |f| (r, f))).collect();
+    if all.is_empty() {
+        return;
+    }
+    all.sort_by(|a, b| b.1.severity.cmp(&a.1.severity));
+    println!("{}", "═".repeat(w).cyan());
+    println!("{}", format!("  🚨 {} finding(s), highest severity first", all.len()).bold().red());
+    println!("{}", "═".repeat(w).cyan());
+    for (r, f) in all {
+        println!("[{:^6}] {}  {}", f.severity.label(), short_name(&r.repository).bold(), format!("{}:{}", middle(&f.file, w.saturating_sub(45).max(20)), f.line).yellow());
+        println!("         {} {}", f.secret_type, f.value.dimmed());
+    }
+    println!();
 }
 
 /// Write a JSON payload to stdout (`None` or `-`) or to a file.
@@ -850,5 +918,40 @@ mod tests {
     fn mask_hides_short_and_long_values() {
         assert_eq!(mask("short"), "****");
         assert_eq!(mask("abcdefghijkl"), "ab****kl");
+    }
+
+    fn finding(file: &str, line: usize, t: &str, sev: Severity, v: &str) -> Finding {
+        Finding { file: file.into(), line, variable: "apiKey".into(), secret_type: t.into(), severity: sev, value: v.into(), url: String::new() }
+    }
+
+    /// Visual check of the live output: `cargo test render_demo -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn render_demo() {
+        colored::control::set_override(false);
+        let base = |url: &str| RepoReport { repository: url.into(), status: "scanned", files_scanned: 12, ..Default::default() };
+        let mut hit = base("https://github.com/acme/billing-service");
+        hit.branch = Some("main".into());
+        hit.languages = vec![("Rust".into(), 80.0), ("Shell".into(), 19.5), ("Make".into(), 0.5)];
+        hit.matched_files = vec!["deploy/prod/config/application-production.properties".into()];
+        hit.findings = vec![
+            finding("deploy/prod/config/very/long/nested/path/application-production.properties", 14, "AWS Access Key", Severity::High, "AK****LE"),
+            finding("src/settings.json", 3, "Public Key", Severity::Low, "pk****xx"),
+        ];
+        hit.env_references = vec![EnvReference { file: "a.js".into(), line: 2, text: "pw = process.env.PW".into() }];
+        let clean = base("https://github.com/acme/website");
+        let mut skipped = base("https://github.com/acme/docs");
+        skipped.status = "skipped";
+        skipped.note = Some("documentation repository".into());
+        let mut failed = base("https://github.com/acme/gone");
+        failed.status = "error";
+        failed.note = Some("Failed to get repository files: status 404".into());
+
+        let w = 80;
+        print_line(&clean);
+        print_line(&skipped);
+        print_line(&failed);
+        print_report(&hit, 4, 4, w);
+        print_findings_summary(&[hit, clean], w);
     }
 }

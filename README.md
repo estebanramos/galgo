@@ -149,6 +149,7 @@ galgo -d example.com -l --json repos.json         # write to file
 **Output (all modes)**
 
 - `--json [FILE]` — Output JSON instead of boxes. Omit FILE to print to stdout; use `-` for stdout explicitly. Progress and summaries go to stderr, so `> out.json` is clean.
+- `-v, --verbose` — Full box for every repo (default: boxes only for repos with findings, one line for the rest).
 - `--show-secrets` — Print full secret values (masked like `AK****LE` by default).
 - `--no-color` — Disable colors (automatic when stdout is not a terminal).
 

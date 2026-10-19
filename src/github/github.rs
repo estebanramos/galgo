@@ -235,9 +235,7 @@ pub async fn search(
 
     use indicatif::{ProgressBar, ProgressStyle};
 
-    eprintln!("\n{}", "═".repeat(80).cyan());
-    eprintln!("{}", format!("  🔍 Step 1/3: Searching GitHub for repositories matching '{}'", domain).bold().cyan());
-    eprintln!("{}\n", "═".repeat(80).cyan());
+    eprintln!("{}", format!("🔍 Searching GitHub code for '{}'", domain).bold().cyan());
 
     let search_pb = ProgressBar::new_spinner();
     search_pb.set_style(ProgressStyle::default_spinner()
@@ -328,9 +326,7 @@ pub async fn search(
         if page == 1 {
             search_pb.finish_with_message("✅ Found matches, processing...");
             let hits_to_process = total_count.min(MAX_TOTAL_RESULTS as u64);
-            eprintln!("\n{}", "─".repeat(80).cyan());
-            eprintln!("{}", format!("  🔄 Step 2/3: Fetching commit dates ({} matching files)...", hits_to_process).bold().cyan());
-            eprintln!("{}\n", "─".repeat(80).cyan());
+            eprintln!("{}", format!("🔄 {} matching files, fetching commit dates", hits_to_process).cyan());
 
             let pb = ProgressBar::new(hits_to_process);
             pb.set_style(ProgressStyle::default_bar()
@@ -446,9 +442,7 @@ pub async fn search(
     }
 
     let file_count: usize = repository_list.values().map(|r| r.files_urls.len()).sum();
-    eprintln!("\n{}", "─".repeat(80).cyan());
-    eprintln!("{}", format!("  📊 Step 3/3: Found {} unique repositories ({} matching files)", repository_list.len(), file_count).bold().cyan());
-    eprintln!("{}\n", "─".repeat(80).cyan());
+    eprintln!("{}", format!("📊 {} unique repositories ({} matching files)", repository_list.len(), file_count).bold().cyan());
 
     Ok((repository_list, error_counter))
 }

@@ -130,8 +130,27 @@ Previously a missing token printed an error and exited `0`.
   `--show-secrets`).
 - Token lookup is silent when it succeeds (no more "Trying to read token…"
   noise or a warning when the env var is unset but `token.txt` exists).
-- One report box per repository for both modes (`print_report`), plus a final
-  summary line: repositories scanned, with findings, total findings.
+- One report box per repository for both modes (`print_report`).
+
+### Live output (second pass)
+- **Live status line** at the bottom: `[12/38] org/repo  3 finding(s) so far`
+  (indicatif `MultiProgress`). Finished repos are printed above it, so output
+  never garbles. In whole-repo mode the per-file bar sits under it.
+- **Clean, skipped and failed repos take one line** (`✓` / `⏭` / `✗`). A full
+  box is printed only for repos with findings; `-v/--verbose` restores boxes for
+  every repo. `--quiet` still hides clean and skipped ones, but errors always
+  show.
+- **Findings summary at the end**: every finding across repos, highest severity
+  first, followed by a one-line tally (scanned / with findings / skipped /
+  errors) on stderr.
+- **Adaptive width** (terminal width clamped to 60-110, 80 when piped); long
+  file paths are shortened in the middle, keeping the file name.
+- **Compact banners**: the three "Step n/3" blocks of the search became one
+  line each; the scan header is a single line.
+- The env-based lines are only counted in the box (details in `--json`);
+  language shares are one line (`Rust 80.0% · Shell 19.5%`).
+- `cargo test render_demo -- --ignored --nocapture` renders sample output for
+  visual checks without a token.
 
 ---
 
