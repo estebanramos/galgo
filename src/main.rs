@@ -166,7 +166,8 @@ async fn main() {
         let label = format!("#{} ({})", i + 1, describe_token(t));
         match github::check_token(t).await {
             Ok((login, quota)) => {
-                say(format!("   {} {} {}: {}", "✅".green(), label, login.as_deref().map(|l| format!("@{}", l)).unwrap_or_default(), quota));
+                let mark = if quota.contains("core 0/") { "⚠️".yellow() } else { "✅".green() };
+                say(format!("   {} {} {}: {}", mark, label, login.as_deref().map(|l| format!("@{}", l)).unwrap_or_default(), quota));
                 if let Some(l) = login {
                     if logins.contains(&l) {
                         say(format!("   {} {} belongs to the same account as an earlier token: the search limit is per account, so it will not add search capacity", "⚠️".yellow(), label));
@@ -209,7 +210,7 @@ async fn main() {
         return;
     };
 
-    let findings = run_scan(repos, &token, error_counter, ScanOptions {
+    let (findings, aborted) = run_scan(repos, &token, error_counter, ScanOptions {
         mode,
         domain: args.search.domain,
         sort_order: args.search.sort,
@@ -224,5 +225,8 @@ async fn main() {
     // Exit codes: 0 = clean, 1 = secrets found, 2 = usage/auth/API error.
     if findings > 0 {
         std::process::exit(1);
+    }
+    if aborted {
+        std::process::exit(2);
     }
 }

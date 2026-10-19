@@ -156,7 +156,7 @@ static CLIENT: Lazy<Client> = Lazy::new(|| {
 });
 
 /// Longest we are willing to sleep for a single rate-limit window before giving up.
-const MAX_RATE_LIMIT_WAIT_SECS: u64 = 120;
+pub const MAX_RATE_LIMIT_WAIT_SECS: u64 = 120;
 const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 
 /// Seconds to wait before retrying, taken from `Retry-After` or `X-RateLimit-Reset`.

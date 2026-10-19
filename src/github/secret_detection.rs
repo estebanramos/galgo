@@ -1,4 +1,4 @@
-use crate::token::TokenPool;
+use crate::token::{Bucket, Pick, TokenPool};
 use super::Repository;
 use std::collections::HashMap;
 use std::io::Write;
@@ -165,6 +165,87 @@ impl Severity {
     }
 }
 
+/// How likely a match is to be a real, exposed secret. Low confidence also caps the severity.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "lowercase")]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+}
+
+/// Other places a line can read a secret from: it is a reference, not an exposed value.
+const EXTERNAL_SOURCES: &[&str] = &[
+    "os.environ", "process.env", "getenv()", "os.getenv", "os.Getenv", "System.getenv", "System.getProperty",
+    "Environment.GetEnvironmentVariable", "ENV.fetch", "ENV[", "import.meta.env", "Deno.env", "${{", "{{ .Values",
+    "secretsmanager", "keyring.get_password", "getpass",
+];
+
+const CODE_EXTENSIONS: &[&str] = &[
+    "py", "js", "jsx", "ts", "tsx", "go", "java", "kt", "rb", "php", "cs", "rs", "swift", "scala", "c", "cpp", "h", "m", "dart", "lua", "pl",
+];
+
+/// Values of these types have a fixed provider format; a word-like value cannot be one of them.
+const GENERIC_TYPES: &[&str] = &["Password", "XML Password", "Credentials", "API Key", "Access Token", "Secret Key"];
+
+const PLACEHOLDER_WORDS: &[&str] = &[
+    "password", "passwd", "secret", "token", "default", "defaults", "credentials", "credential", "creds", "none", "null",
+    "undefined", "true", "false", "string", "required", "optional", "empty", "unset", "admin", "root", "user", "username",
+];
+
+fn entropy(s: &str) -> f64 {
+    let mut counts = HashMap::new();
+    for c in s.chars() { *counts.entry(c).or_insert(0usize) += 1; }
+    let n = s.chars().count() as f64;
+    counts.values().map(|&c| { let p = c as f64 / n; -p * p.log2() }).sum()
+}
+
+fn in_test_path(file: &str) -> bool {
+    let lower = file.to_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    lower.split('/').any(|seg| matches!(seg, "test" | "tests" | "__tests__" | "spec" | "specs" | "testdata" | "fixtures" | "fixture"
+        | "mock" | "mocks" | "__mocks__" | "demo" | "demos" | "example" | "examples" | "sample" | "samples" | "e2e" | "docs"))
+        || name.starts_with("test_") || name.contains(".test.") || name.contains(".spec.") || name.contains("_test.")
+}
+
+/// Judge how credible a match is. Returns the confidence and the reasons it was lowered.
+fn assess(file: &str, line: &str, secret_type: &str, value: &str) -> (Confidence, Vec<String>) {
+    let mut strong: Vec<String> = Vec::new();
+    let generic = GENERIC_TYPES.contains(&secret_type);
+    let ext = file.rsplit('.').next().unwrap_or("").to_lowercase();
+    let is_code = CODE_EXTENSIONS.contains(&ext.as_str());
+
+    if let Some(pos) = line.find(value) {
+        let before = line[..pos].chars().next_back();
+        let after = line[pos + value.len()..].trim_start();
+        let quoted = matches!(before, Some('"' | '\'' | '`'));
+        let ident = value.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+            && value.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.');
+        if is_code && !quoted && generic {
+            if after.starts_with('(') {
+                strong.push("value is a function call, not a literal".into());
+            } else if ident {
+                strong.push("value is a variable reference, not a literal".into());
+            }
+        }
+    }
+    let lower = value.to_lowercase();
+    if value.contains("****") || value.contains("<") || value.contains("{{") || value.contains("${") || value.contains("%s")
+        || PLACEHOLDER_WORDS.contains(&lower.as_str()) || value.chars().collect::<std::collections::HashSet<_>>().len() <= 2 {
+        strong.push("placeholder-looking value".into());
+    } else if generic && value.chars().all(|c| c.is_alphabetic() || c == '_' || c == '-') && entropy(value) < 3.6 {
+        strong.push("looks like a word or identifier, not a random secret".into());
+    }
+
+    if !strong.is_empty() {
+        return (Confidence::Low, strong);
+    }
+    if in_test_path(file) {
+        return (Confidence::Medium, vec!["file is under a test/demo/example path".into()]);
+    }
+    (Confidence::High, Vec::new())
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Finding {
     pub file: String,
@@ -172,6 +253,9 @@ pub struct Finding {
     pub variable: String,
     pub secret_type: String,
     pub severity: Severity,
+    pub confidence: Confidence,
+    /// Why confidence was lowered (empty when high).
+    pub reasons: Vec<String>,
     /// Masked unless `--show-secrets` is given.
     pub value: String,
     /// Link to the exact line on GitHub.
@@ -337,11 +421,7 @@ pub fn scan_content(file: &str, url: &str, content: &str, reveal: bool) -> ScanO
             let line = &content[line_start..line_end];
             let line_no = content.as_bytes()[..match_start].iter().filter(|&&b| b == b'\n').count() + 1;
 
-            let reads_env = line.contains("os.environ")
-                || line.contains("process.env")
-                || line.contains("getenv()")
-                || line.contains("os.getenv")
-                || ENV_PLACEHOLDER_REGEX.is_match(line);
+            let reads_env = EXTERNAL_SOURCES.iter().any(|m| line.contains(m)) || ENV_PLACEHOLDER_REGEX.is_match(line);
             if reads_env {
                 if !out.env_references.iter().any(|r| r.line == line_no) {
                     out.env_references.push(EnvReference { file: file.to_string(), line: line_no, text: line.trim().to_string() });
@@ -360,13 +440,23 @@ pub fn scan_content(file: &str, url: &str, content: &str, reveal: bool) -> ScanO
 
             let variable = extract_var_name(&captures, secret_type, line, line_start, match_start);
             // The secret is the last capture group that participated, or the whole match.
-            let value = (1..captures.len()).rev().find_map(|i| captures.get(i)).unwrap_or(m).as_str();
+            // Some patterns' character classes swallow the closing quote / delimiter.
+            let value = (1..captures.len()).rev().find_map(|i| captures.get(i)).unwrap_or(m).as_str()
+                .trim_end_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | ';' | ')'));
+            let (confidence, reasons) = assess(file, line, secret_type, value);
+            let severity = match confidence {
+                Confidence::Low => Severity::Low,
+                Confidence::Medium => Severity::of(secret_type).min(Severity::Medium),
+                Confidence::High => Severity::of(secret_type),
+            };
             out.findings.push(Finding {
                 file: file.to_string(),
                 line: line_no,
                 variable,
                 secret_type: secret_type.to_string(),
-                severity: Severity::of(secret_type),
+                severity,
+                confidence,
+                reasons,
                 value: if reveal { value.to_string() } else { mask(value) },
                 url: format!("{}#L{}", url, line_no),
             });
@@ -717,6 +807,9 @@ fn print_report(r: &RepoReport, index: usize, total: usize, w: usize, verbose: b
             let what = if f.variable != "unknown" { format!("{}: {}", f.variable.bold().cyan(), f.secret_type) } else { f.secret_type.clone() };
             println!("│  [{}] {}:{}", f.severity.label(), link(&middle(&f.file, w.saturating_sub(18).max(20)), &f.url).bold().yellow(), f.line);
             println!("│         {}  {}", what, f.value.dimmed());
+            if !f.reasons.is_empty() {
+                println!("│         {}", format!("↓ {} confidence: {}", format!("{:?}", f.confidence).to_lowercase(), f.reasons.join("; ")).dimmed());
+            }
         }
     }
     if !r.env_references.is_empty() {
@@ -786,8 +879,8 @@ pub struct ScanOptions {
 }
 
 /// Scan every repository and report. Boxes (or JSON) go to stdout, headers and summaries to stderr.
-/// Returns the total number of findings.
-pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, error_counter: super::github::HttpErrorCounter, opts: ScanOptions) -> usize {
+/// Returns the total number of findings and whether the run was cut short by exhausted rate limits.
+pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, error_counter: super::github::HttpErrorCounter, opts: ScanOptions) -> (usize, bool) {
     let mut repos: Vec<Repository> = result.into_values().collect();
     let key = |r: &Repository| repo_sort_date(r, &opts.commit_date_kind);
     match opts.sort_order.as_str() {
@@ -813,7 +906,26 @@ pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, er
 
     let mut reports: Vec<RepoReport> = Vec::new();
     let mut findings_so_far = 0;
+    let mut aborted = false;
+    let mut reports_not_scanned = 0;
     for (i, repo) in repos.iter().enumerate() {
+        // Every token is limited for longer than get_text() is willing to wait: stop instead of failing each remaining repo.
+        if let Pick::AllLimited(wait) = token.pick(Bucket::Core) {
+            if wait.as_secs() > super::github::MAX_RATE_LIMIT_WAIT_SECS {
+                let at = chrono::Local::now() + chrono::Duration::from_std(wait).unwrap_or_default();
+                mp.suspend(|| eprintln!("{}", format!(
+                    "⛔ GitHub rate limit exhausted on all {} token(s); resets in {} min (at {}). {} repositories not scanned. Re-run later, add more tokens (GITHUB_TOKENS) or lower --max-repos.",
+                    token.len(), wait.as_secs() / 60 + 1, at.format("%H:%M"), total - i).bold().red()));
+                for r in &repos[i..] {
+                    let mut skipped = RepoReport::new(r).fail("skipped", "not scanned: rate limit exhausted");
+                    skipped.status = "skipped";
+                    reports_not_scanned += 1;
+                    if opts.json.is_some() { reports.push(skipped); }
+                }
+                aborted = true;
+                break;
+            }
+        }
         status.set_message(format!("{}  {}", short_name(&repo.repository_url).bold(), format!("{} finding(s) so far", findings_so_far).dimmed()));
         let report = match opts.mode {
             ScanMode::SingleFile => scan_single(repo, token, &error_counter, opts.show_secrets).await,
@@ -848,11 +960,13 @@ pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, er
     let with_findings = reports.iter().filter(|r| !r.findings.is_empty()).count();
     let errors = reports.iter().filter(|r| r.status == "error").count();
     let skipped = reports.iter().filter(|r| r.status == "skipped").count();
-    let summary = format!("✨ {} repositories: {} with findings ({} total), {} skipped, {} errors",
-        total, with_findings, findings, skipped, errors);
+    let skipped = skipped - if opts.json.is_some() { reports_not_scanned } else { 0 };
+    let not_scanned = if reports_not_scanned > 0 { format!(", {} not scanned (rate limit)", reports_not_scanned) } else { String::new() };
+    let summary = format!("✨ {} repositories: {} with findings ({} total), {} skipped, {} errors{}",
+        total, with_findings, findings, skipped, errors, not_scanned);
     eprintln!("{}", if findings > 0 { summary.bold().red() } else { summary.bold().green() });
     error_counter.print_summary();
-    findings
+    (findings, aborted)
 }
 
 /// Per-repo ranking for runs where findings are spread over several repositories (the boxes have scrolled by).
@@ -1006,13 +1120,31 @@ mod tests {
     }
 
     #[test]
+    fn confidence_drops_for_references_placeholders_and_test_paths() {
+        let scan = |file: &str, line: &str| scan_content(file, "u", line, true).findings;
+        // function call / variable reference in code: not a literal
+        let f = scan("src/a.ts", "const creds = decryptCredentialsFromStore(ctx);");
+        assert_eq!((f[0].confidence, f[0].severity), (Confidence::Low, Severity::Low));
+        // same text in a config file is a literal
+        let f = scan("conf/app.ini", "DB_PASSWORD = Xk9mQ2vL8zR4tW7p;");
+        assert_eq!(f[0].confidence, Confidence::High);
+        // real-looking value in a test path: medium, capped severity, trailing quote and comma stripped
+        let f = scan("tests/test_store.py", r#"    EDENOR_PASSWORD = "Xk9mQ2vL8zR4",;"#);
+        assert_eq!((f[0].confidence, f[0].severity), (Confidence::Medium, Severity::Medium));
+        assert_eq!(f[0].value, "Xk9mQ2vL8zR4");
+        // other secret stores are references, not findings
+        let out = scan_content("main.go", "u", "DB_PASSWORD = os.Getenv(\"DB_PASSWORD_VALUE\")", true);
+        assert!(out.findings.is_empty() && out.env_references.len() == 1);
+    }
+
+    #[test]
     fn mask_hides_short_and_long_values() {
         assert_eq!(mask("short"), "****");
         assert_eq!(mask("abcdefghijkl"), "ab****kl");
     }
 
     fn finding(file: &str, line: usize, t: &str, sev: Severity, v: &str) -> Finding {
-        Finding { file: file.into(), line, variable: "apiKey".into(), secret_type: t.into(), severity: sev, value: v.into(), url: String::new() }
+        Finding { file: file.into(), line, variable: "apiKey".into(), secret_type: t.into(), severity: sev, confidence: Confidence::High, reasons: Vec::new(), value: v.into(), url: String::new() }
     }
 
     /// Visual check of the live output: `cargo test render_demo -- --ignored --nocapture`

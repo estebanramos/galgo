@@ -175,6 +175,27 @@ Previously a missing token printed an error and exited `0`.
 - **No duplicated findings list.** The end summary now appears only when two or
   more repos have findings, as one line per repo with counts per severity.
 
+### False-positive control and rate-limit abort (fifth pass)
+- **Confidence on every finding** (`confidence`: high/medium/low, plus `reasons`
+  in JSON and a dim `↓ low confidence: …` line in the box). Low confidence caps
+  severity at LOW, medium at MEDIUM. Lowered when: the value is a function call
+  or a bare variable in a code file (unquoted), looks like a placeholder
+  (`****`, `<…>`, `{{…}}`, `password`, `default`…), is a plain word/identifier
+  with low entropy (generic types only: Password, API Key, Credentials…), or
+  (medium) the file is under a test/demo/example/fixtures path.
+- **More secret stores treated as references** (listed under env-based lines, not
+  reported): `os.Getenv`, `System.getenv/getProperty`,
+  `Environment.GetEnvironmentVariable`, `ENV[`/`ENV.fetch`, `import.meta.env`,
+  `Deno.env`, `${{ … }}`, Helm `{{ .Values }}`, `secretsmanager`, `getpass`,
+  `keyring.get_password`.
+- Trailing quote/comma/`;`/`)` swallowed by pattern character classes is trimmed
+  from the reported value (it showed as `sh****",`).
+- **Rate-limit abort.** When every token is limited for longer than the 120 s
+  wait cap, the scan stops once with the reset time and the number of repos not
+  scanned (instead of one error line per remaining repo), JSON lists them as
+  `skipped`, and the exit code is 2 unless findings exist. Startup shows `⚠️`
+  when core quota is 0.
+
 ## 5. Token handling and rotation
 
 ### Sources
