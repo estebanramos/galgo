@@ -71,17 +71,17 @@
     "description": "JWT Tokens (eyJ...)"
   },
   {
-    "pattern": "(?i)(-----BEGIN\\s+(RSA\\s+)?PRIVATE\\s+KEY-----)",
+    "pattern": "(?i)(-----BEGIN\\s+(?:RSA\\s+)?PRIVATE\\s+KEY-----)",
     "secret_type": "Private Key",
     "description": "Private Keys (RSA, EC, etc.)"
   },
   {
-    "pattern": "(?i)(-----BEGIN\\s+(OPENSSH\\s+)?PRIVATE\\s+KEY-----)",
+    "pattern": "(?i)(-----BEGIN\\s+(?:OPENSSH\\s+)?PRIVATE\\s+KEY-----)",
     "secret_type": "SSH Private Key",
     "description": "SSH Private Keys"
   },
   {
-    "pattern": "(?i)(-----BEGIN\\s+(RSA\\s+)?PUBLIC\\s+KEY-----)",
+    "pattern": "(?i)(-----BEGIN\\s+(?:RSA\\s+)?PUBLIC\\s+KEY-----)",
     "secret_type": "Public Key",
     "description": "Public Keys (less critical but still worth flagging)"
   },
@@ -96,12 +96,12 @@
     "description": "Google OAuth Client Secret"
   },
   {
-    "pattern": "(?i)(stripe[_-]?secret[_-]?key|stripe[_-]?api[_-]?key)\\s*[=:]\\s*[\"']?(sk_(live|test)_[A-Za-z0-9]{24,})[\"']?",
+    "pattern": "(?i)(stripe[_-]?secret[_-]?key|stripe[_-]?api[_-]?key)\\s*[=:]\\s*[\"']?(sk_(?:live|test)_[A-Za-z0-9]{24,})[\"']?",
     "secret_type": "Stripe Secret Key",
     "description": "Stripe API Keys (sk_live_... or sk_test_...)"
   },
   {
-    "pattern": "(?i)(stripe[_-]?publishable[_-]?key)\\s*[=:]\\s*[\"']?(pk_(live|test)_[A-Za-z0-9]{24,})[\"']?",
+    "pattern": "(?i)(stripe[_-]?publishable[_-]?key)\\s*[=:]\\s*[\"']?(pk_(?:live|test)_[A-Za-z0-9]{24,})[\"']?",
     "secret_type": "Stripe Publishable Key",
     "description": "Stripe Publishable Keys (pk_live_... or pk_test_...)"
   },

@@ -196,6 +196,25 @@ Previously a missing token printed an error and exited `0`.
   `skipped`, and the exit code is 2 unless findings exist. Startup shows `⚠️`
   when core quota is 0.
 
+### Detection fixes and fixtures (sixth pass)
+- **False negatives fixed.** Three exclusions discarded real secrets:
+  `["']\s*$` (any line ending in a quote, e.g. `KEY = "value"`), the
+  line-wide `example|test_|demo_|sample_` placeholder match, and `(#|//).*(test|example…)`
+  (any URL containing `//`, so `postgres://…/test` was dropped). The "empty value"
+  exclusion was removed (every pattern already requires a minimum length); the
+  comment exclusion now applies to whole-line comments only, and placeholders
+  (`your_`, `changeme`, `<…>`, `example`, `xxx`, `test_`/`demo_`/`sample_` prefix)
+  are checked against the **value** only. Expect more findings than before.
+- **Wrong captured value fixed.** Nested groups in `patterns.json` (`(live|test)`,
+  `(RSA\s+)?`, `(OPENSSH\s+)?`) made the reported value `test` or `RSA `; they are
+  non-capturing now. Stripe `sk_test_`/`pk_test_` keys are low confidence.
+- **`tests/fixtures/cases.tsv`**: expected outcome (find / skip / env / lowconf)
+  per line of code, checked by `fixtures_match_expected_outcomes`. Add a row for
+  every false positive or negative you fix.
+- **CI** (`.github/workflows/ci.yml`): build, test, clippy on push and PR.
+- Known limit: bare `password:` / `password =` (no prefix in the name) is not
+  matched by the Password pattern, nor bare `API_KEY` by the API Key pattern.
+
 ## 5. Token handling and rotation
 
 ### Sources

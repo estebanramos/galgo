@@ -24,18 +24,22 @@ const FILES_EXTENSIONS: &[&str] = &[".html", ".csv", ".md"];
 // Maximum number of files to analyze per repository (GitHub API limit is 100,000, but we use a conservative limit)
 const MAX_FILES_PER_REPO: usize = 50000;
 
-// Patterns to exclude (false positives) - these indicate the secret comes from env vars or processes
+// Whole-line exclusions (false positives): the secret comes from env vars or processes, or the line is a comment
+// that says it is an example. Placeholders are checked against the value alone (PLACEHOLDER_VALUE).
+// The old "empty value" and line-wide "example/test_" exclusions were dropped: every pattern already requires a
+// minimum value length, and they discarded real secrets (any line ending in a quote, any URL containing "//").
 static EXCLUSION_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
     vec![
         // Environment variables
         Regex::new(r#"(?i)(process\.env|os\.getenv|os\.environ|getenv|environ\[|System\.getenv|ENV\[|env\.get)\s*[\[\(]?["']?\w+["']?[\]\)]?"#).unwrap(),
-        // Configuration placeholders
-        Regex::new(r#"(?i)(placeholder|example|your_|test_|demo_|sample_|xxx|yyyy|changeme|replaceme)"#).unwrap(),
-        // Empty or very short values
-        Regex::new(r#"(?i)["']\s*["']|["']\s*$|=\s*["']\s*["']|=\s*$"#).unwrap(),
-        // Comments indicating it's not a real secret
-        Regex::new(r#"(?i)(#|//|/\*).*(example|placeholder|test|demo|sample|changeme)"#).unwrap(),
+        // A line that is only a comment saying it is an example
+        Regex::new(r#"(?i)^\s*(#|//|/\*|\*).*(example|placeholder|test|demo|sample|changeme)"#).unwrap(),
     ]
+});
+
+/// Values that are obviously not secrets.
+static PLACEHOLDER_VALUE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)(placeholder|example|your[_-]|changeme|replaceme|xxx|yyyy|^(test|demo|sample)[_-]|<[^>]*>)"#).unwrap()
 });
 
 const PATTERNS_JSON: &str = include_str!("../../patterns.json");
@@ -237,6 +241,9 @@ fn assess(file: &str, line: &str, secret_type: &str, value: &str) -> (Confidence
         strong.push("looks like a word or identifier, not a random secret".into());
     }
 
+    if value.starts_with("sk_test_") || value.starts_with("pk_test_") {
+        strong.push("Stripe test-mode key".into());
+    }
     if !strong.is_empty() {
         return (Confidence::Low, strong);
     }
@@ -443,6 +450,9 @@ pub fn scan_content(file: &str, url: &str, content: &str, reveal: bool) -> ScanO
             // Some patterns' character classes swallow the closing quote / delimiter.
             let value = (1..captures.len()).rev().find_map(|i| captures.get(i)).unwrap_or(m).as_str()
                 .trim_end_matches(|c| matches!(c, '"' | '\'' | '`' | ',' | ';' | ')'));
+            if PLACEHOLDER_VALUE.is_match(value) {
+                continue;
+            }
             let (confidence, reasons) = assess(file, line, secret_type, value);
             let severity = match confidence {
                 Confidence::Low => Severity::Low,
@@ -1135,6 +1145,22 @@ mod tests {
         // other secret stores are references, not findings
         let out = scan_content("main.go", "u", "DB_PASSWORD = os.Getenv(\"DB_PASSWORD_VALUE\")", true);
         assert!(out.findings.is_empty() && out.env_references.len() == 1);
+    }
+
+    /// Every line of tests/fixtures/cases.tsv must produce the expected outcome. Add a row for each false
+    /// positive / negative you fix.
+    #[test]
+    fn fixtures_match_expected_outcomes() {
+        let mut wrong = Vec::new();
+        let cases: Vec<_> = include_str!("../../tests/fixtures/cases.tsv").lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect();
+        for case in &cases {
+            let [expect, file, line, why] = case.splitn(4, '\t').collect::<Vec<_>>()[..] else { panic!("bad fixture row: {case}") };
+            let out = scan_content(file, "u", line, true);
+            let got = if out.findings.is_empty() { if out.env_references.is_empty() { "skip" } else { "env" } }
+                else if out.findings.iter().all(|f| f.severity == Severity::Low) { "lowconf" } else { "find" };
+            if got != expect { wrong.push(format!("expected {expect}, got {got}: {why}\n    {line}")); }
+        }
+        assert!(wrong.is_empty(), "{}/{} fixture(s) wrong:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
     }
 
     #[test]

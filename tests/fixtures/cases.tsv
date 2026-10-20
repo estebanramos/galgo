@@ -1,0 +1,21 @@
+# expect<TAB>file<TAB>line<TAB>why
+# expect: find = reported, skip = nothing, env = env reference only, lowconf = reported, all LOW
+find	src/config.py	aws_access_key_id = "AKIAJ3Q7XK2M9ZP4W6NB"	AWS access key, line ends in a quote
+find	src/config.py	GITHUB_TOKEN = "ghp_aB3dE5gH7jK9mN1pQ3sT5vW7yZ9bC1dE3fG5"	GitHub token, quoted
+find	app/settings.py	DB_PASSWORD = "Xk9mQ2vL8zR4tW7p"	regression: quoted value at end of line used to be excluded
+find	app/settings.py	STRIPE_API_KEY = "abcdef1234567890abcdef"	regression: documented false negative
+find	conf/db.js	DATABASE_URI = "postgres://user:Sup3rS3cret@db.internal:5432/test"	regression: // in a URL is not a comment
+find	src/app.js	const PAYMENT_API_KEY = "Zk8Qm2Xv9Lp4Rt7Wn3Bc5Yd"; // see https://example.com/docs	regression: trailing comment mentioning example
+find	conf/app.yml	db_password: Xk9mQ2vL8zR4tW7p	unquoted YAML value
+find	conf/app.ini	DB_PASSWORD = Xk9mQ2vL8zR4tW7p	unquoted ini value
+find	keys/id_rsa	-----BEGIN RSA PRIVATE KEY-----	private key header
+find	web.config	<add key="DbPassword" value="Sup3rS3cret99" />	XML config password
+skip	src/config.py	SERVICE_API_KEY = "your_api_key_here_please_replace"	placeholder value
+skip	src/config.py	DB_PASSWORD = "changeme"	placeholder value
+skip	src/config.py	# SERVICE_API_KEY = "abcd1234efgh5678ijkl9012"  # example only	full-line example comment
+skip	src/config.py	AWS_ACCESS_KEY_ID = "<your-access-key-id-here>"	angle-bracket placeholder
+env	src/app.js	DB_PASSWORD = process.env.DB_PASSWORD_VALUE	process.env
+env	main.go	DB_PASSWORD = os.Getenv("DB_PASSWORD_VALUE_LONG")	Go os.Getenv
+env	ci.yml	DB_PASSWORD: ${{secrets.DB_PASSWORD}}	GitHub Actions secret
+lowconf	src/a.ts	const creds = decryptCredentialsFromStore(ctx);	function call, not a literal
+lowconf	tests/test_store.py	stripe_secret_key = "sk_test_4eC39HqLyjWDarjtT1zdp7dcAbCdEf"	Stripe test key under tests/
