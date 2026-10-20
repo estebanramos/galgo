@@ -122,6 +122,8 @@ classDiagram
       file, line
       variable, secret_type
       severity: low|medium|high
+      confidence: low|medium|high
+      reasons: [string]
       value  masked by default
       url    ...#L line
     }
@@ -254,7 +256,7 @@ For every match of every pattern:
 5. `extract_var_name` infers the variable name: group 1 if it looks like an
    identifier, otherwise heuristics over the line (declaration keywords,
    `name = value`, last word before the assignment).
-6. Build the `Finding`: severity from `Severity::of(secret_type)`, value masked
+6. Build the `Finding`: `assess()` yields a confidence and reasons (function call / variable reference in code, placeholder or low-entropy word for generic types, test/demo path); severity is `Severity::of(secret_type)` capped by confidence (low → LOW, medium → MEDIUM); value trimmed of trailing quote/delimiter and masked
    by `mask()` unless `reveal` (`--show-secrets`), URL = file URL + `#L<line>`.
 
 ### Severity
@@ -368,7 +370,7 @@ So `galgo -d x.com -s --json > out.json` produces valid JSON.
 (`[12/38] org/repo  3 finding(s) so far`); finished repositories are printed
 through `mp.suspend(..)` so they appear above it. Repositories with findings get
 a full box (`print_report`), the rest one line (`print_line`) unless `--verbose`.
-At the end, `print_findings_summary` lists every finding, high severity first.
+At the end, `print_findings_summary` prints one line per affected repository (counts per severity), only when two or more repositories have findings; a single affected repo is already fully shown in its box.
 
 **Exit codes**: `0` clean, `1` findings, `2` usage/token/API error.
 
@@ -397,6 +399,8 @@ At the end, `print_findings_summary` lists every finding, high severity first.
         "variable": "aws_access_key_id",
         "secret_type": "AWS Access Key",
         "severity": "high",
+        "confidence": "high",
+        "reasons": [],
         "value": "AK****LE",
         "url": "https://github.com/org/repo/blob/main/config/app.properties#L14"
       }

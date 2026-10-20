@@ -52,8 +52,8 @@ Galgo starts from what you know, **your domain**, and works outward:
 - **Domain-first search.** Uses GitHub code search to find files that mention your domain.
 - **Three modes.** `single-file` (only the matching files), `whole-repo` (every config-like file of each repo) and `list` (no scanning).
 - **Findings you can act on.** Each one has file, **line number**, variable name, type, **severity** and a link to the exact line. Values are **masked** by default (`AK****LE`).
-- **Fewer false alarms.** Skips docs/demo/tutorial repositories and the company's own repositories in whole-repo mode, ignores placeholders, and reports `process.env` / `${VAR}` lines separately instead of as leaks.
-- **Live, readable output.** A status line shows progress while repositories are printed above it; clean repositories take one line, repositories with findings get a full box, and a final summary lists everything by severity.
+- **Fewer false alarms.** Skips docs/demo/tutorial repositories (whole-word match) and the company's own repositories in whole-repo mode, scores every finding's **confidence** (references, placeholders and test paths are downgraded) and reports `process.env` / `os.Getenv` / `${VAR}` lines separately instead of as leaks.
+- **Live, readable output.** A status line shows progress while repositories are printed above it; clean repositories take one line, repositories with findings get a box with the findings first, and names and locations are clickable links.
 - **Scriptable.** JSON output in every mode, results on stdout and progress on stderr, exit codes for CI.
 - **Rate-limit aware.** Waits for the reset window and **rotates between several tokens** when one is exhausted.
 - **Customizable.** Detection rules live in a plain `patterns.json`.
@@ -154,36 +154,37 @@ Repositories without findings take one line; repositories with findings get a fu
 box. A status line at the bottom shows progress (`[12/38] org/repo  3 finding(s) so far`).
 
 ```
-✓ acme/website  12 file(s) scanned, no secrets
-⏭  acme/docs  documentation repository
+✓ acme/website  ★ 1.2k  12 file(s) scanned, no secrets
+    ↳ config/app.yml  clean
+⏭  acme/docs  Repository name contains 'docs' (likely documentation/report/analysis repo)
 ✗ acme/gone  Failed to get repository files: status 404
 ┌ Repository [4/4] ──────────────────────────────────────────────────────────────┐
 │ 🔗 URL: https://github.com/acme/billing-service
 ├────────────────────────────────────────────────────────────────────────────────┤
-│ 🌿 Branch: main
-│ 🌐 Languages: Rust 80.0% · Shell 19.5% · Other 0.5%
-├────────────────────────────────────────────────────────────────────────────────┤
-│ 📝 Files: deploy/prod/config/application-production.properties
-│ 📊 Scanned: 12 file(s)
-├────────────────────────────────────────────────────────────────────────────────┤
 │ 🚨 Secrets Found: 2 potential secret(s)
-│   [HIGH] deploy/prod/config/v…oduction.properties:14 (apiKey: AWS Access Key) AK****LE
-│   [LOW] src/settings.json:3 (apiKey: Public Key) pk****xx
+│  [HIGH] deploy/prod/config/application-production.properties:14
+│         apiKey: AWS Access Key  AK****LE
+│  [LOW] tests/fixtures/settings.json:3
+│         apiKey: Public Key  pk****xx
+│         ↓ low confidence: file is under a test/demo/example path
+├────────────────────────────────────────────────────────────────────────────────┤
+│ ⭐ Stats: ★ 87 · ⑂ 12 · MIT
+│ 🌐 Languages: Rust 80.0% · Shell 19.5% · Other 0.5%
+│ 📊 Scanned: 12 file(s)
+│ 📆 Last commit: 12/09/2026 10:41 UTC
 └────────────────────────────────────────────────────────────────────────────────┘
 ════════════════════════════════════════════════════════════════════════════════
-  🚨 2 finding(s), highest severity first
+  🚨 5 finding(s) in 2 repositories, highest severity first
 ════════════════════════════════════════════════════════════════════════════════
-[ HIGH ] acme/billing-service  deploy/prod/confi…uction.properties:14
-         AWS Access Key AK****LE
-[ LOW  ] acme/billing-service  src/settings.json:3
-         Public Key pk****xx
+[ HIGH ] acme/billing-service  1 high · 1 low
+[ MEDIUM ] acme/payments  3 medium
 ```
 
 *(Sample rendered with synthetic data. Run `cargo test render_demo -- --ignored --nocapture` to reproduce it.)*
 
 | Symbol | Meaning |
 |--------|---------|
-| `✓` | Scanned, nothing found |
+| `✓` | Scanned, nothing found (a `↳` line lists the matched files and what happened to each) |
 | `⏭` | Skipped (documentation repo, owner matches the domain, too many files…) |
 | `✗` | Error (the reason is shown) |
 | `ℹ️ Env-based` | Lines such as `password = process.env.DB_PASS`: reported as a count, not as secrets |
@@ -191,6 +192,18 @@ box. A status line at the bottom shows progress (`[12/38] org/repo  3 finding(s)
 **Severity**: `HIGH` (private keys, passwords, cloud and service secrets),
 `MEDIUM` (generic API keys, access tokens, usernames), `LOW` (public or
 publishable keys, host keys).
+
+**Confidence**: each finding is `high`, `medium` or `low` confidence, with the
+reasons shown under it. Low confidence caps severity at `LOW` (value is a function
+call or variable reference, a placeholder, or a plain word); medium caps it at
+`MEDIUM` (file under a `test`/`demo`/`example`/`fixtures` path). Lines that read a
+secret from elsewhere (`process.env`, `os.Getenv`, `${{ secrets.X }}`, secret
+managers…) are listed as env-based references, not findings.
+
+**Clickable links.** In a terminal that supports hyperlinks (GNOME Terminal,
+Kitty, iTerm2, WezTerm, Windows Terminal, VS Code…), repository names, matched
+files and `file:line` locations are links to GitHub. `-v` adds branch,
+description, topics, last push and the full per-file outcome.
 
 **Streams.** Results go to **stdout**; banners, progress, the final tally and
 HTTP error summary go to **stderr**. Piping or redirecting stdout gives you clean data.
@@ -201,7 +214,7 @@ HTTP error summary go to **stderr**. Piping or redirecting stdout gives you clea
 |------|---------|
 | `0` | Scan finished, no secrets found |
 | `1` | At least one secret found |
-| `2` | Usage, token or API error |
+| `2` | Usage, token or API error, or the scan was cut short because every token hit its rate limit (the reset time is printed) |
 
 ## Usage examples
 
@@ -254,7 +267,7 @@ Run `galgo --help` for the same list.
 ## JSON output and CI
 
 `--json` prints an array with one object per repository (findings with file,
-line, type, severity, masked value and URL; env references; languages; dates).
+line, type, severity, confidence and reasons, masked value and URL; env references; matched files and their outcome; stars, forks, license; languages; dates).
 The schema is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#10-output-contract).
 
 ```bash
