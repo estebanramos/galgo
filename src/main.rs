@@ -7,6 +7,7 @@ use token::{describe_token, get_tokens, TokenPool};
 use crate::github::{list_repositories, run_scan, ScanMode, ScanOptions};
 
 mod github;
+mod ignore;
 mod token;
 
 #[derive(Parser, Debug)]
@@ -55,6 +56,12 @@ struct SearchConfig {
 
     #[arg(long, value_parser = validate_commit_date_kind, default_value = "file", help = "Which date to use for sorting and display: 'file' (last commit of the found file, default) or 'repo' (last commit on the repo)")]
     commit_date: String,
+
+    #[arg(long, value_name = "FILE", help = "Detection rules (JSON, same format as patterns.json) replacing the built-in ones")]
+    patterns: Option<std::path::PathBuf>,
+
+    #[arg(long, value_name = "FILE", help = "Ignore rules (default: ./.galgoignore if it exists): owner/repo, owner/*, path:<text>, rule:<Type>")]
+    ignore_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -152,6 +159,21 @@ async fn main() {
         std::process::exit(2);
     };
 
+    if let Some(path) = &args.search.patterns {
+        match github::load_patterns_file(path) {
+            Ok(n) => eprintln!("📐 {} detection rule(s) loaded from {}", n, path.display()),
+            Err(e) => { eprintln!("❌ {}", e); std::process::exit(2); }
+        }
+    }
+    let ignore_path = args.search.ignore_file.clone().or_else(|| Some(std::path::PathBuf::from(".galgoignore")).filter(|p| p.exists()));
+    let ignore = match &ignore_path {
+        Some(p) => match ignore::IgnoreList::load(p) {
+            Ok(l) => { eprintln!("🙈 {} ignore rule(s) loaded from {}", l.len(), p.display()); l }
+            Err(e) => { eprintln!("❌ {}", e); std::process::exit(2); }
+        },
+        None => ignore::IgnoreList::default(),
+    };
+
     let (tokens, source) = get_tokens().unwrap_or_else(|e| {
         eprintln!("{}", e);
         std::process::exit(2);
@@ -219,6 +241,7 @@ async fn main() {
         quiet: args.output.quiet,
         verbose: args.output.verbose,
         show_secrets: args.output.show_secrets,
+        ignore,
         json: args.output.json,
     }).await;
 

@@ -44,42 +44,38 @@ static PLACEHOLDER_VALUE: Lazy<Regex> = Lazy::new(|| {
 
 const PATTERNS_JSON: &str = include_str!("../../patterns.json");
 
-// Secret detection patterns with improved accuracy - captures variable name and secret type
+/// Rules given with `--patterns FILE` replace the embedded patterns.json.
+static CUSTOM_PATTERNS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Parse a patterns.json document into compiled rules. Disabled rules are dropped.
+fn parse_patterns(json: &str) -> Result<Vec<(Regex, String)>, String> {
+    let value: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("invalid JSON: {e}"))?;
+    let arr = value.as_array().ok_or("patterns file must be a JSON array")?;
+    let mut rules = Vec::new();
+    for (i, item) in arr.iter().enumerate() {
+        if item["disabled"].as_bool().unwrap_or(false) {
+            continue;
+        }
+        let pattern = item["pattern"].as_str().ok_or(format!("rule #{}: missing string 'pattern'", i + 1))?;
+        let secret_type = item["secret_type"].as_str().ok_or(format!("rule #{}: missing string 'secret_type'", i + 1))?;
+        let re = Regex::new(pattern).map_err(|e| format!("rule #{} ({}): invalid regex: {}", i + 1, secret_type, e))?;
+        rules.push((re, secret_type.to_string()));
+    }
+    Ok(rules)
+}
+
+/// Replace the built-in rules with the ones in `path`. Call before the first scan; returns the rule count.
+pub fn load_patterns_file(path: &Path) -> Result<usize, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+    let n = parse_patterns(&text).map_err(|e| format!("{}: {}", path.display(), e))?.len();
+    CUSTOM_PATTERNS.set(text).map_err(|_| "patterns already loaded".to_string())?;
+    Ok(n)
+}
+
+// Secret detection patterns - captures variable name and secret type
 // Pattern format: (Regex, SecretType) where Regex captures groups: (variable_name, secret_value)
 static PATTERNS: Lazy<Vec<(Regex, String)>> = Lazy::new(|| {
-    let value: serde_json::Value =
-        serde_json::from_str(PATTERNS_JSON).expect("Failed to parse patterns.json");
-
-    let arr = value
-        .as_array()
-        .expect("patterns.json must be a JSON array");
-
-    arr.iter()
-        .filter_map(|item| {
-            // Check if pattern is disabled (defaults to enabled if field is missing)
-            let disabled = item["disabled"]
-                .as_bool()
-                .unwrap_or(false);
-            
-            if disabled {
-                return None; // Skip disabled patterns
-            }
-            
-            let pattern = item["pattern"]
-                .as_str()
-                .expect("Each pattern must have a string 'pattern' field");
-            let secret_type = item["secret_type"]
-                .as_str()
-                .expect("Each pattern must have a string 'secret_type' field")
-                .to_string();
-
-            let re = Regex::new(pattern).unwrap_or_else(|e| {
-                panic!("Invalid regex in patterns.json: {} ({})", pattern, e)
-            });
-
-            Some((re, secret_type))
-        })
-        .collect()
+    parse_patterns(CUSTOM_PATTERNS.get().map(String::as_str).unwrap_or(PATTERNS_JSON)).expect("invalid patterns")
 });
 
 
@@ -884,6 +880,7 @@ pub struct ScanOptions {
     /// Print a full box for every repository, even clean ones.
     pub verbose: bool,
     pub show_secrets: bool,
+    pub ignore: crate::ignore::IgnoreList,
     /// `Some(None)` = JSON to stdout, `Some(Some(path))` = JSON to file.
     pub json: Option<Option<std::path::PathBuf>>,
 }
@@ -917,6 +914,7 @@ pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, er
     let mut reports: Vec<RepoReport> = Vec::new();
     let mut findings_so_far = 0;
     let mut aborted = false;
+    let mut ignored_findings = 0;
     let mut reports_not_scanned = 0;
     for (i, repo) in repos.iter().enumerate() {
         // Every token is limited for longer than get_text() is willing to wait: stop instead of failing each remaining repo.
@@ -937,10 +935,15 @@ pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, er
             }
         }
         status.set_message(format!("{}  {}", short_name(&repo.repository_url).bold(), format!("{} finding(s) so far", findings_so_far).dimmed()));
-        let report = match opts.mode {
+        let mut report = if opts.ignore.ignores_repo(short_name(&repo.repository_url)) {
+            RepoReport::new(repo).fail("skipped", "ignored by .galgoignore")
+        } else { match opts.mode {
             ScanMode::SingleFile => scan_single(repo, token, &error_counter, opts.show_secrets).await,
             ScanMode::WholeRepo => scan_whole(repo, token, &opts.domain, &error_counter, opts.max_files, opts.show_secrets, &mp).await,
-        };
+        } };
+        let before = report.findings.len();
+        report.findings.retain(|f| !opts.ignore.ignores_finding(&f.file, &f.secret_type));
+        ignored_findings += before - report.findings.len();
         status.inc(1);
         findings_so_far += report.findings.len();
         let hidden = opts.quiet && report.findings.is_empty() && report.status != "error";
@@ -972,8 +975,9 @@ pub async fn run_scan(result: HashMap<String, Repository>, token: &TokenPool, er
     let skipped = reports.iter().filter(|r| r.status == "skipped").count();
     let skipped = skipped - if opts.json.is_some() { reports_not_scanned } else { 0 };
     let not_scanned = if reports_not_scanned > 0 { format!(", {} not scanned (rate limit)", reports_not_scanned) } else { String::new() };
-    let summary = format!("✨ {} repositories: {} with findings ({} total), {} skipped, {} errors{}",
-        total, with_findings, findings, skipped, errors, not_scanned);
+    let ignored = if ignored_findings > 0 { format!(", {} finding(s) ignored by .galgoignore", ignored_findings) } else { String::new() };
+    let summary = format!("✨ {} repositories: {} with findings ({} total), {} skipped, {} errors{}{}",
+        total, with_findings, findings, skipped, errors, not_scanned, ignored);
     eprintln!("{}", if findings > 0 { summary.bold().red() } else { summary.bold().green() });
     error_counter.print_summary();
     (findings, aborted)

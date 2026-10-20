@@ -215,6 +215,16 @@ Previously a missing token printed an error and exited `0`.
 - Known limit: bare `password:` / `password =` (no prefix in the name) is not
   matched by the Password pattern, nor bare `API_KEY` by the API Key pattern.
 
+### Distribution and configuration (seventh pass)
+- `--patterns FILE` replaces the embedded rules at run time (validated up front).
+- `.galgoignore` / `--ignore-file FILE`: `owner/repo`, `owner/*`, `path:<text>`,
+  `rule:<Type>`; ignored repos are skipped and ignored findings are counted.
+- reqwest now uses `rustls-tls` (no OpenSSL dependency), which makes release
+  binaries and the Docker image portable.
+- `.github/workflows/release.yml` builds Linux/macOS/Windows binaries on a `v*`
+  tag and attaches them to the release (not run yet).
+- `Dockerfile` (multi-stage, tested: builds and queries the live API).
+
 ## 5. Token handling and rotation
 
 ### Sources

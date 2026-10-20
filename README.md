@@ -60,7 +60,17 @@ Galgo starts from what you know, **your domain**, and works outward:
 
 ## Installation
 
-You need a recent stable [Rust toolchain](https://rustup.rs/) (edition 2021).
+**Prebuilt binaries** (Linux, macOS, Windows) are attached to each
+[GitHub release](https://github.com/estebanramos/galgo/releases): download, unpack, run.
+
+**Docker**
+
+```bash
+docker build -t galgo .
+docker run --rm -e GITHUB_TOKEN galgo -d example.com -s
+```
+
+**From source.** You need a recent stable [Rust toolchain](https://rustup.rs/) (edition 2021).
 
 ```bash
 git clone https://github.com/estebanramos/galgo.git
@@ -293,7 +303,29 @@ Because of the exit codes, Galgo can gate a pipeline. Example for GitHub Actions
   with: { name: galgo-report, path: galgo.json }
 ```
 
+## Ignoring false positives
+
+Put a `.galgoignore` in the directory you run Galgo from (or pass `--ignore-file FILE`):
+
+```
+# skip a repository, or every repository of an owner
+acme/legacy-docs
+acme-labs/*
+# drop findings whose file path contains this text
+path:vendor/
+path:/fixtures/
+# drop a whole secret type
+rule:Public Key
+```
+
+Ignored repositories show as skipped, and the final tally counts the findings dropped by the file.
+
 ## Custom detection patterns
+
+To use your own rules without recompiling, pass a JSON file in the format below with
+`--patterns FILE`. It **replaces** the built-in `patterns.json`; invalid regexes are
+reported with their rule number and the run exits with code `2`. Start from a copy of
+the repository's `patterns.json`.
 
 Rules live in [`patterns.json`](patterns.json) and are embedded at build time, so
 **rebuild after editing**.
