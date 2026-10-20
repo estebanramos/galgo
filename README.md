@@ -270,6 +270,8 @@ HTTP error summary go to **stderr**. Piping or redirecting stdout gives you clea
 - `-q, --quiet`: only report repositories with findings (errors are still shown).
 - `-v, --verbose`: full box for every repository.
 - `--show-secrets`: print real values instead of masked ones.
+- `--patterns <FILE>`: use your own detection rules instead of the built-in ones.
+- `--ignore-file <FILE>`: ignore rules (default: `./.galgoignore` if present).
 - `--no-color`: disable colors (automatic when stdout is not a terminal; `NO_COLOR` is honored).
 
 Run `galgo --help` for the same list.
