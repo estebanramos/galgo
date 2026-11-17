@@ -1074,8 +1074,9 @@ pub async fn list_repositories(
         write_json(&list, json_dest.as_deref());
     } else {
         // Human-readable output
-        println!("\n{} Found {} repository(ies) (sorted by {} commit date)\n", "📋".green(), total_repos.to_string().bold(), kind);
+        println!("\n{}\n", format!("📋 {} repositories · sorted by {} commit date", total_repos, kind).bold().cyan());
 
+        const SHOWN: usize = 5;
         for (_, repo) in repos {
             let urls = filter_files_by_extension(
                 &repo.files_urls,
@@ -1086,23 +1087,15 @@ pub async fn list_repositories(
             if urls.is_empty() && (include_ext.is_some() || exclude_ext.is_some()) {
                 continue;
             }
-            let files_list: Vec<String> = urls.iter().map(|url| extract_file_path(url)).collect();
-            let files_str = if files_list.is_empty() {
-                "None".to_string()
-            } else {
-                files_list.join(", ")
-            };
-
-            let file_commit_date = repo.last_commit_date_file.format("%d/%m/%Y %H:%M:%S UTC").to_string();
-            let repo_commit_date = repo.last_commit_date.format("%d/%m/%Y %H:%M:%S UTC").to_string();
-
-            println!("• {}", repo.repository_url.cyan().bold());
-            println!("  • Last commit (file): {}", file_commit_date.yellow());
-            println!("  • Last commit (repo): {}", repo_commit_date.yellow());
-            println!("  • Files: {}", files_str.green());
-            println!();
+            let dates = format!("file {} · repo {}", repo.last_commit_date_file.format("%Y-%m-%d"), repo.last_commit_date.format("%Y-%m-%d"));
+            println!("{} {}  {}", "•".cyan(), link(short_name(&repo.repository_url), &repo.repository_url).bold(), dates.dimmed());
+            for url in urls.iter().take(SHOWN) {
+                println!("    {} {}", "↳".dimmed(), link(&extract_file_path(url), &clean_url(url)));
+            }
+            if urls.len() > SHOWN {
+                println!("    {}", format!("… +{} more matching file(s)", urls.len() - SHOWN).dimmed());
+            }
         }
-
         println!();
     }
 
